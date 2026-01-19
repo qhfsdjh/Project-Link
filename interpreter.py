@@ -32,7 +32,10 @@ TIMEOUT = config.OLLAMA_TIMEOUT
 MAX_RETRIES = config.PL_AI_MAX_RETRIES
 RETRY_DELAY = config.PL_AI_RETRY_DELAY
 
-# ==================== 对话历史缓存（最近5轮）====================
+TrackType = Literal["daily", "meeting"]
+
+
+# ==================== 对话历史缓存（最近3轮）====================
 # 用于上下文感知和指代消解（"刚才那个"、"它"、"改一下"等）
 _conversation_history = []
 
@@ -67,6 +70,66 @@ def clear_history():
     """清空对话历史"""
     global _conversation_history
     _conversation_history = []
+
+
+def _detect_track(user_input: str) -> TrackType:
+    """
+    根据长度与关键词粗分两类轨道：
+    - daily  : 日常碎碎念 / 简短提醒
+    - meeting: 会议纪要 / 长文总结
+    """
+    text = (user_input or "").strip()
+    length = len(text)
+
+    # 明确会议/总结类关键词
+    meeting_keywords = [
+        "会议纪要",
+        "会议记录",
+        "总结一下",
+        "帮我总结",
+        "帮我梳理",
+        "复盘一下",
+        "行动项",
+        "待办清单",
+        "meeting",
+        "记录一下刚才的会议",
+    ]
+
+    # 明确日常提醒类关键词
+    daily_keywords = [
+        "提醒我",
+        "记下",
+        "帮我记",
+        "待会",
+        "一会儿",
+        "稍后提醒",
+        "明天",
+        "后天",
+        "下周",
+        "喝水",
+        "休息一下",
+    ]
+
+    # 长文本优先视为会议轨道
+    if length > 200:
+        for kw in meeting_keywords:
+            if kw in text:
+                return "meeting"
+        # 超长但没明显会议词，也按 meeting 处理，后续再细分
+        return "meeting"
+
+    # 短文本且包含日常提醒关键词，优先走 daily 快通道
+    for kw in daily_keywords:
+        if kw in text:
+            return "daily"
+
+    # 包含会议/总结词但不算特别长，也归入 meeting 轨道
+    for kw in meeting_keywords:
+        if kw in text:
+            return "meeting"
+
+    # 默认视为 daily，保证日常体验优先丝滑
+    return "daily"
 
 # ==================== 工具函数 ====================
 
@@ -534,6 +597,10 @@ def process_user_input(user_text: str) -> bool:
     Returns:
         是否处理成功
     """
+    # 轨道检测：区分日常快通道 / 会议长文本
+    track: TrackType = _detect_track(user_text)
+    logger.info(f"[track] current_track={track}")
+
     # 1. 先记录原始对话（保存每一句记忆）
     # 注意：这里只记录原始输入，不记录 sentiment 和 tag
     # 如果后续解析成功且是 record_memory，会更新该记录而不是新增
@@ -551,7 +618,7 @@ def process_user_input(user_text: str) -> bool:
         # 继续执行，不因为记录失败而中断
     
     # 2. 让 AI 解析意图（支持上下文感知）
-    logger.info(f"开始解析用户输入: {user_text[:50]}...")
+    logger.info(f"开始解析用户输入: {user_text[:50]}... (track={track})")
 
     # 完成意图兜底：像“我已经喝了/做完了”这种，优先标记最近 pending 为 done（不走 cancel）
     if _is_completion_intent(user_text):
