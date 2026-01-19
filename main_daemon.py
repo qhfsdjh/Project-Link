@@ -10,7 +10,6 @@ import os
 import signal
 import sys
 import sqlite3
-from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
@@ -33,32 +32,20 @@ class ProjectLinkApp(rumps.App):
         # 线程锁（用于保护共享资源）
         self.lock = threading.Lock()
         
-        # 任务菜单项列表（用于管理动态菜单项）
-        self.task_menu_items = []
-        
-        # 创建固定菜单项
+        # 禁用 rumps 默认 Quit（我们提供自定义“退出”，用于优雅关闭 scheduler）
+        # 说明：rumps 会默认注入 Quit 菜单项；如果不禁用，就会出现两个 Quit。
+        self.quit_button = None
+
+        # 创建固定菜单项（后续 update_menu 会重建整个菜单）
         self.quick_chat_item = rumps.MenuItem("快速对话", callback=self.start_quick_chat)
         self.menu = [self.quick_chat_item]
-        
-        # 创建并启动后台调度器
-        self.scheduler = BackgroundScheduler()
-        self.scheduler.start()
-        logger.info("后台调度器已启动")
-        
-        # 添加定时任务
-        self.scheduler.add_job(
-            self.update_menu,
-            'interval',
-            seconds=config.PL_DAEMON_MENU_UPDATE_INTERVAL,
-            id='update_menu'
-        )
-        self.scheduler.add_job(
-            self.check_and_notify,
-            'interval',
-            seconds=config.PL_DAEMON_CHECK_INTERVAL,
-            id='check_tasks'
-        )
-        logger.info(f"定时任务已添加：菜单更新间隔 {config.PL_DAEMON_MENU_UPDATE_INTERVAL} 秒，任务检查间隔 {config.PL_DAEMON_CHECK_INTERVAL} 秒")
+
+        # 使用 rumps.Timer 确保所有 UI 操作在主线程执行（Cocoa/rumps 的硬要求）
+        self.menu_timer = rumps.Timer(self.update_menu, config.PL_DAEMON_MENU_UPDATE_INTERVAL)
+        self.check_timer = rumps.Timer(self.check_and_notify, config.PL_DAEMON_CHECK_INTERVAL)
+        self.menu_timer.start()
+        self.check_timer.start()
+        logger.info(f"主线程定时器已启动：菜单更新间隔 {config.PL_DAEMON_MENU_UPDATE_INTERVAL} 秒，任务检查间隔 {config.PL_DAEMON_CHECK_INTERVAL} 秒")
         
         # 启动时立即更新一次菜单
         self.update_menu()
@@ -74,20 +61,23 @@ class ProjectLinkApp(rumps.App):
         logger.info(f"收到信号 {signum}，开始优雅退出...")
         self.quit_application(None)
     
-    @rumps.clicked("Quit")
-    def quit_application(self, _):
-        """优雅退出应用"""
-        logger.info("用户选择退出，开始关闭调度器...")
-        
-        # 关闭后台调度器
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=True)
-            logger.info("后台调度器已关闭")
+    def quit_application(self, _=None):
+        """优雅退出应用（自定义“退出”菜单项会调用这里）"""
+        logger.info("用户选择退出，开始关闭定时器...")
+
+        try:
+            if getattr(self, "menu_timer", None):
+                self.menu_timer.stop()
+            if getattr(self, "check_timer", None):
+                self.check_timer.stop()
+            logger.info("主线程定时器已关闭")
+        except Exception as e:
+            logger.warning(f"关闭定时器失败: {e}")
         
         # 调用父类的退出方法
         rumps.quit_application(None)
     
-    def update_menu(self):
+    def update_menu(self, _=None):
         """更新菜单列表（使用非阻塞锁）"""
         # 使用非阻塞锁，避免 UI 阻塞
         if not self.lock.acquire(blocking=False):
@@ -95,14 +85,11 @@ class ProjectLinkApp(rumps.App):
             return
         
         try:
-            # 删除旧任务菜单项
-            for item in self.task_menu_items:
-                if item in self.menu:
-                    del self.menu[item]
-            self.task_menu_items.clear()
-            
-            # 添加分隔符
-            self.menu.add(None)
+            # 直接重建整个菜单（rumps.Menu 的删除语义在不同版本上不一致）
+            # 这样最稳健，也天然避免“旧菜单项引用不可删除/不可哈希”的问题。
+            self.menu.clear()
+            self.menu.add(self.quick_chat_item)
+            self.menu.add(None)  # 分隔符
             
             # 获取最新任务
             try:
@@ -110,25 +97,36 @@ class ProjectLinkApp(rumps.App):
                 
                 if tasks:
                     for task in tasks:
+                        suffix = ""
+                        if task.get("due_time"):
+                            try:
+                                dt = parse_time(task["due_time"])
+                                suffix = f" ({dt.strftime('%H:%M')})"
+                            except Exception:
+                                suffix = ""
+                        content = (task.get("content") or "")
+                        content_short = content[:30] + ("..." if len(content) > 30 else "")
                         # 使用 lambda 闭包正确绑定 task_id
                         menu_item = rumps.MenuItem(
-                            f"{task['content'][:30]}...",
+                            f"{content_short}{suffix}",
                             callback=lambda _, tid=task['id']: self.show_task_dialog(tid)
                         )
                         self.menu.add(menu_item)
-                        self.task_menu_items.append(menu_item)
                 else:
                     no_task_item = rumps.MenuItem("暂无任务")
                     self.menu.add(no_task_item)
-                    self.task_menu_items.append(no_task_item)
             except Exception as e:
                 logger.error(f"获取任务列表失败: {e}", exc_info=True)
+
+            # 底部固定区
+            self.menu.add(None)
+            self.menu.add(rumps.MenuItem("退出", callback=self.quit_application))
                 
         finally:
             # 确保锁被释放
             self.lock.release()
     
-    def check_and_notify(self):
+    def check_and_notify(self, _=None):
         """检查并通知任务"""
         try:
             with self.lock:
@@ -220,7 +218,7 @@ class ProjectLinkApp(rumps.App):
             task_id: 任务 ID
         
         Returns:
-            "完成", "推迟 30 分钟", "稍后", 或 None（超时/取消）
+            "完成", "推迟", "暂时忽略", 或 None（超时/取消）
         """
         try:
             task = database.get_task_by_id(task_id)
@@ -228,16 +226,26 @@ class ProjectLinkApp(rumps.App):
                 logger.warning(f"任务 {task_id} 不存在")
                 return None
             
-            content = escape_apple_script(task['content'])
+            # 弹窗信息增强：显示任务内容 + 原始到期时间（MM-DD HH:mm）
+            due_display = "(无截止)"
+            if task.get("due_time"):
+                try:
+                    dt = parse_time(task["due_time"])
+                    due_display = dt.strftime("%m-%d %H:%M")
+                except Exception:
+                    due_display = str(task.get("due_time"))
+
+            message = f"任务提醒:\\n{task.get('content')}\\n截止：{due_display}"
+            message_escaped = escape_apple_script(message)
             
             # 构建 AppleScript（置顶优化）
             script = f'''
             tell application "System Events" to activate
             try
-                set theAnswer to display dialog "任务提醒: {content}" buttons {{"完成", "推迟 30 分钟", "稍后"}} default button "稍后"
+                set theAnswer to display dialog "{message_escaped}" buttons {{"完成", "推迟", "暂时忽略"}} default button "暂时忽略"
                 return button returned of theAnswer
             on error
-                return "稍后"
+                return "暂时忽略"
             end try
             '''
             
@@ -251,7 +259,7 @@ class ProjectLinkApp(rumps.App):
             response = result.stdout.strip()
             
             # 验证返回值
-            valid_responses = ["完成", "推迟 30 分钟", "稍后"]
+            valid_responses = ["完成", "推迟", "暂时忽略"]
             if response in valid_responses:
                 logger.info(f"用户选择: {response} (任务 {task_id})")
                 return response
@@ -260,7 +268,7 @@ class ProjectLinkApp(rumps.App):
                 return None
                 
         except subprocess.TimeoutExpired:
-            logger.warning(f"对话框超时，视为'稍后处理' (任务 {task_id})")
+            logger.warning(f"对话框超时，视为'暂时忽略' (任务 {task_id})")
             return None
         except Exception as e:
             logger.error(f"对话框执行失败 (任务 {task_id}): {e}", exc_info=True)
@@ -276,27 +284,36 @@ class ProjectLinkApp(rumps.App):
         """
         try:
             if response == "完成":
-                # 二次确认
-                if self.confirm_completion(task_id):
-                    database.update_task_status(task_id, 'done')
-                    database.update_task_notification_time(task_id)
-                    logger.info(f"任务 {task_id} 已标记为完成")
-                    # 更新菜单（因为任务状态改变）
-                    self.update_menu()
-                else:
-                    logger.info(f"用户取消完成任务 {task_id}")
+                # 提升效率：取消二次确认，直接完成
+                database.update_task_status(task_id, 'done')
+                logger.info(f"任务 {task_id} 已标记为完成")
+                self.update_menu()
+                try:
+                    rumps.notification("Project Link", "", "任务已完成 ✅")
+                except Exception as e:
+                    logger.debug(f"发送系统通知失败: {e}")
             
-            elif response == "推迟 30 分钟":
-                # 推迟任务
-                if self.postpone_task(task_id, minutes=config.PL_DAEMON_POSTPONE_MINUTES):
-                    logger.info(f"任务 {task_id} 已推迟 {config.PL_DAEMON_POSTPONE_MINUTES} 分钟")
+            elif response == "推迟":
+                # 推迟任务：弹出输入框询问推迟分钟数（默认 30，防呆）
+                minutes = self.ask_postpone_minutes(default_minutes=30)
+                if minutes is None:
+                    return
+                if minutes <= 0:
+                    # <=0：视为“暂时忽略”
+                    database.update_task_notification_time(task_id)
+                    logger.info(f"任务 {task_id} 暂时忽略（由推迟输入 <=0 触发）")
+                    return
+                minutes = min(minutes, 4320)
+                if self.postpone_task(task_id, minutes=minutes):
+                    logger.info(f"任务 {task_id} 已推迟 {minutes} 分钟")
+                    self.update_menu()
                 else:
                     logger.warning(f"推迟任务 {task_id} 失败")
             
-            elif response == "稍后":
-                # 只更新通知时间（触发冷却计时）
+            elif response == "暂时忽略":
+                # “暂时忽略”的语义：仅更新 last_notified_at（触发冷却），不改 due_time / 不改 status
                 database.update_task_notification_time(task_id)
-                logger.info(f"任务 {task_id} 标记为稍后提醒")
+                logger.info(f"任务 {task_id} 暂时忽略（仅更新 last_notified_at）")
             
             else:
                 logger.warning(f"未知的对话框响应: {response} (任务 {task_id})")
@@ -304,57 +321,35 @@ class ProjectLinkApp(rumps.App):
         except Exception as e:
             logger.error(f"处理对话框响应失败 (任务 {task_id}): {e}", exc_info=True)
     
-    def confirm_completion(self, task_id: int) -> bool:
+    def ask_postpone_minutes(self, default_minutes: int = 30) -> Optional[int]:
         """
-        显示确认对话框（置顶优化）
-        
-        Args:
-            task_id: 任务 ID
-        
-        Returns:
-            True 如果用户确认，False 如果取消
+        弹出输入框询问“推迟多少分钟？”
+        防呆策略：
+        - 空/非数字：默认 30
+        - <=0：视为“暂时忽略”
+        - 上限在调用方截断为 4320（3天）
         """
         try:
-            task = database.get_task_by_id(task_id)
-            if not task:
-                return False
-            
-            content = escape_apple_script(task['content'])
-            
-            # 构建 AppleScript（置顶优化）
-            script = f'''
-            tell application "System Events" to activate
-            try
-                set theAnswer to display dialog "确认完成任务？\\n\\n{content}" buttons {{"确认", "取消"}} default button "确认"
-                return button returned of theAnswer
-            on error
-                return "取消"
-            end try
-            '''
-            
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                timeout=config.PL_DAEMON_DIALOG_TIMEOUT
+            window = rumps.Window(
+                message="推迟多少分钟？",
+                title="Project Link",
+                default_text=str(default_minutes),
+                ok="确定",
+                cancel="取消",
             )
-            
-            response = result.stdout.strip()
-            confirmed = response == "确认"
-            
-            if confirmed:
-                logger.info(f"用户确认完成任务 {task_id}")
-            else:
-                logger.info(f"用户取消完成任务 {task_id}")
-            
-            return confirmed
-            
-        except subprocess.TimeoutExpired:
-            logger.warning(f"确认对话框超时，视为取消 (任务 {task_id})")
-            return False
+            res = window.run()
+            if not res.clicked:
+                return None
+            raw = (res.text or "").strip()
+            if not raw:
+                return default_minutes
+            try:
+                return int(raw)
+            except ValueError:
+                return default_minutes
         except Exception as e:
-            logger.error(f"确认对话框失败 (任务 {task_id}): {e}", exc_info=True)
-            return False
+            logger.error(f"推迟输入框失败: {e}", exc_info=True)
+            return default_minutes
     
     def postpone_task(self, task_id: int, minutes: int) -> bool:
         """
@@ -402,7 +397,6 @@ class ProjectLinkApp(rumps.App):
             logger.error(f"推迟任务失败 (任务 {task_id}): {e}", exc_info=True)
             return False
     
-    @rumps.clicked("快速对话")
     def start_quick_chat(self, _):
         """打开新的终端窗口运行 interpreter.py"""
         try:

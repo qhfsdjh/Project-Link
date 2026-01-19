@@ -146,7 +146,7 @@ def validate_action_data(result: Optional[Dict[str, Any]]) -> Tuple[Optional[str
         return None, None
     
     # 验证 action 值
-    valid_actions = ("add_task", "add_preference", "record_memory", "query_tasks")
+    valid_actions = ("add_task", "add_preference", "record_memory", "query_tasks", "update_task", "cancel_task", "chat")
     if action not in valid_actions:
         logger.error(f"未知的 action: '{action}'，有效值: {valid_actions}")
         print(f"❌ 未知的 action: '{action}'，有效值: {valid_actions}")
@@ -169,7 +169,13 @@ def get_ai_interpretation(user_input: str) -> Optional[Dict[str, Any]]:
     """
     # 从 prompts 模块获取提示词（自动注入当前时间信息）
     system_prompt = prompts.get_system_prompt()
-    user_prompt = prompts.get_user_prompt(user_input)
+    # 启发式两段式：把最近 N 条 pending 任务作为候选上下文塞进 prompt
+    recent_tasks = []
+    try:
+        recent_tasks = database.get_recent_tasks(status='pending', limit=3)
+    except Exception as e:
+        logger.warning(f"获取最近任务候选失败: {e}")
+    user_prompt = prompts.get_user_prompt(user_input, recent_tasks=recent_tasks)
     
     try:
         # 使用 ollama.chat() API
@@ -346,6 +352,125 @@ def process_user_input(user_text: str) -> bool:
                     print(f"⚠️  警告: 记录记忆失败: {e}")
             return True
         
+        elif action == "update_task":
+            # 更新已有任务（修改标题/时间/优先级/分类）
+            task_id = data.get("task_id")
+            if task_id is None:
+                # 如果只有一个候选 pending，则自动选中；否则要求明确
+                candidates = []
+                try:
+                    candidates = database.get_recent_tasks(status='pending', limit=3)
+                except Exception:
+                    candidates = []
+                if len(candidates) == 1:
+                    task_id = candidates[0]["id"]
+                else:
+                    print("❌ 无法确定要修改哪个任务：请明确任务 ID，或说“修改上一个任务…”。")
+                    return False
+
+            try:
+                task_id = int(task_id)
+            except (ValueError, TypeError):
+                print("❌ task_id 必须是整数")
+                return False
+
+            old = database.get_task_by_id(task_id)
+            if not old:
+                print(f"❌ 找不到任务 ID {task_id}")
+                return False
+
+            # 允许部分字段更新
+            new_content = data.get("content") if "content" in data else None
+            new_due_time = parse_due_time(data.get("due_time")) if "due_time" in data else None
+            new_priority = validate_priority(data.get("priority")) if "priority" in data else None
+            new_category = data.get("category") if "category" in data else None
+
+            did_update = False
+
+            if "content" in data:
+                if not isinstance(new_content, str) or not new_content.strip():
+                    print("❌ 新任务内容不能为空")
+                    return False
+                if new_content.strip() != old.get("content"):
+                    database.update_task_content(task_id, new_content.strip())
+                    did_update = True
+
+            if "due_time" in data:
+                # 允许清空截止时间（null/None）
+                database.update_task_due_time(task_id, new_due_time)
+                if new_due_time != old.get("due_time"):
+                    did_update = True
+
+            if new_priority is not None and "priority" in data and new_priority != old.get("priority"):
+                with database.get_db_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute("UPDATE tasks SET priority = ? WHERE id = ?", (new_priority, task_id))
+                    conn.commit()
+                did_update = True
+
+            if "category" in data and new_category != old.get("category"):
+                with database.get_db_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute("UPDATE tasks SET category = ? WHERE id = ?", (new_category, task_id))
+                    conn.commit()
+                did_update = True
+
+            if not did_update:
+                print(f"⚠️  任务 ID {task_id} 没有实际变更（可能是字段未提供或与原值相同）")
+                return True
+
+            updated = database.get_task_by_id(task_id)
+            if not updated:
+                print(f"✅ 已更新任务 ID {task_id}（但读取更新后数据失败）")
+                return True
+
+            # 清晰反馈（前后对比）
+            if updated.get("content") != old.get("content"):
+                print(f"✅ 已将任务 ID {task_id} 的标题从「{old.get('content')}」修改为「{updated.get('content')}」")
+            if updated.get("due_time") != old.get("due_time"):
+                print(f"✅ 已将任务 ID {task_id} 的截止时间从 {old.get('due_time')} 修改为 {updated.get('due_time')}")
+            if updated.get("priority") != old.get("priority"):
+                print(f"✅ 已将任务 ID {task_id} 的优先级从 {old.get('priority')} 修改为 {updated.get('priority')}")
+            if updated.get("category") != old.get("category"):
+                print(f"✅ 已将任务 ID {task_id} 的分类从 {old.get('category')} 修改为 {updated.get('category')}")
+
+            return True
+
+        elif action == "cancel_task":
+            # 软取消任务：status='cancelled'（用于“取消上一个/刚才那个”）
+            task_id = data.get("task_id")
+            if task_id is None:
+                candidates = []
+                try:
+                    candidates = database.get_recent_tasks(status='pending', limit=3)
+                except Exception:
+                    candidates = []
+                if candidates:
+                    task_id = candidates[0]["id"]
+                else:
+                    print("❌ 没有可取消的 pending 任务")
+                    return False
+
+            try:
+                task_id = int(task_id)
+            except (ValueError, TypeError):
+                print("❌ task_id 必须是整数")
+                return False
+
+            old = database.get_task_by_id(task_id)
+            if not old:
+                print(f"❌ 找不到任务 ID {task_id}")
+                return False
+
+            database.cancel_task(task_id)
+            print(f"✅ 已取消任务 ID {task_id}: {old.get('content')}")
+            return True
+
+        elif action == "chat":
+            reply = data.get("reply") if isinstance(data, dict) else None
+            print(reply or "👌")
+            return True
+
         elif action == "query_tasks":
             # 验证数据
             time_range = data.get("time_range", "all")

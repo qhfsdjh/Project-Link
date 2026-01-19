@@ -99,7 +99,7 @@ def get_system_prompt() -> str:
 
 JSON 格式要求：
 {{
-    "action": "add_task" | "add_preference" | "record_memory" | "query_tasks",
+    "action": "add_task" | "add_preference" | "record_memory" | "query_tasks" | "update_task" | "cancel_task" | "chat",
     "data": {{
         // 如果是 add_task: 
         // {{ "content": "任务内容", "due_time": "ISO格式时间字符串或null", "priority": 1-5的整数, "category": "分类(可选)" }}
@@ -109,12 +109,21 @@ JSON 格式要求：
         // {{ "content": "原始信息", "sentiment": "positive/neutral/negative", "tag": "分类标签" }}
         // 如果是 query_tasks:
         // {{ "time_range": "today/tomorrow/upcoming/overdue/all", "status": "pending/done/all", "limit": 数量(可选) }}
+        // 如果是 update_task:
+        // {{ "task_id": 任务ID(必须是整数，优先从候选任务中选择), "content": "新内容(可选)", "due_time": "新的ISO时间或null(可选)", "priority": 1-5(可选), "category": "分类(可选)" }}
+        // 如果是 cancel_task:
+        // {{ "task_id": 任务ID(必须是整数，优先从候选任务中选择) }}
+        // 如果是 chat:
+        // {{ "reply": "给用户的简短回复（非任务/非修改/非查询）" }}
     }}
 }}
 
 判断规则（重要：区分查询意图和添加意图）：
 - query_tasks: 用户询问任务、查询待办事项（如"我明天有什么任务？"、"今天要做什么？"、"有什么过期任务？"）
 - add_task: 用户明确提到要做什么任务、待办事项、计划（如"明天下午3点要开会"）
+- update_task: 用户明确要修改已有任务（如"改一下时间"、"把刚才那个改成..."、"刚才打错了"）
+- cancel_task: 用户明确要取消已有任务（如"取消上一个"、"把刚才那个取消掉"）
+- chat: 用户在闲聊/情绪表达/泛聊，不要求存任务/改任务/查任务（如"你好"、"我有点累"且没有可结构化记忆需求时）
 - add_preference: 用户表达习惯、偏好、工作方式（如"我通常9点上班"）
 - record_memory: 其他所有情况，包括闲聊、状态更新、想法记录
 
@@ -134,6 +143,12 @@ JSON 格式要求：
 用户输入: "有什么过期任务吗？"
 输出: {{"action": "query_tasks", "data": {{"time_range": "overdue", "status": "pending"}}}}
 
+用户输入: "刚才打错了，把上一个任务标题改成写周报"
+输出: {{"action": "update_task", "data": {{"task_id": 9, "content": "写周报"}}}}
+
+用户输入: "取消上一个任务"
+输出: {{"action": "cancel_task", "data": {{"task_id": 9}}}}
+
 用户输入: "我习惯早上喝咖啡"
 输出: {{"action": "add_preference", "data": {{"key": "morning_routine", "value": "喝咖啡", "source": "AI推断"}}}}
 
@@ -142,7 +157,7 @@ JSON 格式要求：
 """
 
 
-def get_user_prompt(user_input: str) -> str:
+def get_user_prompt(user_input: str, recent_tasks: Optional[list] = None) -> str:
     """
     获取用户提示词模板
     
@@ -152,5 +167,24 @@ def get_user_prompt(user_input: str) -> str:
     Returns:
         格式化的用户提示词
     """
-    return f"用户输入: \"{user_input}\"\n请输出 JSON:"
+    context_section = ""
+    if recent_tasks and isinstance(recent_tasks, list) and len(recent_tasks) > 0:
+        lines = []
+        for t in recent_tasks:
+            try:
+                tid = t.get("id")
+                content = (t.get("content") or "").replace("\n", " ")
+                due_time = t.get("due_time")
+                created_at = t.get("created_at")
+                lines.append(f"- ID {tid}: {content} | due_time={due_time} | created_at={created_at}")
+            except Exception:
+                continue
+        if lines:
+            context_section = (
+                "\n【最近待办候选（按创建时间倒序，优先用于“上一个/刚才那个”）】\n"
+                + "\n".join(lines)
+                + "\n\n规则：如果 action 是 update_task 或 cancel_task，你必须从这些候选中选择 task_id（除非用户明确提供了任务ID）。\n"
+            )
+
+    return f"{context_section}用户输入: \"{user_input}\"\n请输出 JSON:"
 

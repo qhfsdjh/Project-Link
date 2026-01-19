@@ -117,7 +117,7 @@ def init_db():
                 due_time TEXT,
                 category TEXT,
                 priority INTEGER CHECK(priority >= 1 AND priority <= 5) DEFAULT 3,
-                status TEXT CHECK(status IN ('pending', 'done', 'ignored')) DEFAULT 'pending',
+                status TEXT CHECK(status IN ('pending', 'done', 'ignored', 'cancelled')) DEFAULT 'pending',
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
@@ -198,6 +198,9 @@ def migrate_database():
         logger.info("开始数据库迁移检查...")
         
         # 2. 迁移 tasks 表
+        # 2.1 硬化：扩展 tasks.status 支持 cancelled（SQLite 无法直接 ALTER CHECK，需重建表）
+        _migrate_tasks_status_check(cursor)
+
         if "last_notified_at" not in tasks_columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN last_notified_at TEXT")
             logger.info("✅ 已添加 tasks.last_notified_at 字段")
@@ -250,6 +253,63 @@ def migrate_database():
         
         # 6. 验证迁移结果
         verify_migration()
+
+
+def _migrate_tasks_status_check(cursor: sqlite3.Cursor) -> None:
+    """
+    扩展 tasks.status 的 CHECK 约束以支持 'cancelled'
+
+    SQLite 不支持直接修改 CHECK 约束，因此采用“重建表”方式：
+    - tasks_new 使用新的 CHECK(status IN (..., 'cancelled'))
+    - 复制数据
+    - 替换旧表
+    - 重建索引（本文件其他逻辑也会 CREATE INDEX IF NOT EXISTS 兜底）
+    """
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'")
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        return
+
+    create_sql = row[0]
+    if "status IN ('pending', 'done', 'ignored', 'cancelled')" in create_sql:
+        logger.debug("tasks.status CHECK 已支持 cancelled，跳过重建")
+        return
+
+    if "status IN ('pending', 'done', 'ignored')" not in create_sql:
+        # 未知的约束形态：保守跳过，避免破坏用户自定义 schema
+        logger.warning("tasks.status CHECK 形态未知，跳过 cancelled 迁移；请手动检查 schema")
+        return
+
+    logger.info("开始迁移 tasks.status CHECK 以支持 cancelled（重建表）...")
+    cursor.execute("PRAGMA foreign_keys=OFF")
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tasks_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                due_time TEXT,
+                category TEXT,
+                priority INTEGER CHECK(priority >= 1 AND priority <= 5) DEFAULT 3,
+                status TEXT CHECK(status IN ('pending', 'done', 'ignored', 'cancelled')) DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_notified_at TEXT,
+                notification_count INTEGER DEFAULT 0
+            )
+        """)
+
+        # 复制数据（保持原有字段）
+        cursor.execute("""
+            INSERT INTO tasks_new (id, content, due_time, category, priority, status, created_at, last_notified_at, notification_count)
+            SELECT id, content, due_time, category, priority, status, created_at, last_notified_at, notification_count
+            FROM tasks
+        """)
+
+        cursor.execute("DROP TABLE tasks")
+        cursor.execute("ALTER TABLE tasks_new RENAME TO tasks")
+
+        logger.info("✅ tasks.status CHECK 已迁移支持 cancelled")
+    finally:
+        cursor.execute("PRAGMA foreign_keys=ON")
 
 
 def verify_migration():
@@ -504,8 +564,8 @@ def update_task_status(task_id: int, status: str):
     """
     更新任务状态
     """
-    if status not in ('pending', 'done', 'ignored'):
-        raise ValueError(f"status 必须是 'pending', 'done' 或 'ignored'，当前值: {status}")
+    if status not in ('pending', 'done', 'ignored', 'cancelled'):
+        raise ValueError(f"status 必须是 'pending', 'done', 'ignored' 或 'cancelled'，当前值: {status}")
     
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -515,6 +575,63 @@ def update_task_status(task_id: int, status: str):
             WHERE id = ?
         """, (status, task_id))
         conn.commit()
+
+
+def cancel_task(task_id: int):
+    """
+    软取消任务（用于“取消上一个”等场景）
+    等价于 update_task_status(task_id, 'cancelled')
+    """
+    update_task_status(task_id, 'cancelled')
+
+
+def update_task_content(task_id: int, content: str):
+    """
+    更新任务内容（标题/描述）
+    """
+    if not content or not isinstance(content, str):
+        raise ValueError("content 不能为空")
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tasks
+            SET content = ?
+            WHERE id = ?
+        """, (content, task_id))
+        conn.commit()
+        logger.debug(f"已更新任务 {task_id} 的内容为: {content}")
+
+
+def get_recent_tasks(status: str = 'pending', limit: int = 3) -> List[Dict[str, Any]]:
+    """
+    获取最近创建的任务列表（默认：最近 3 条 pending）
+    用于 Interpreter 的“上一个任务/刚才那个”上下文候选。
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, content, due_time, category, priority, status, created_at,
+                   last_notified_at, notification_count
+            FROM tasks
+            WHERE status = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (status, limit))
+        results = cursor.fetchall()
+        return [
+            {
+                'id': row[0],
+                'content': row[1],
+                'due_time': row[2],
+                'category': row[3],
+                'priority': row[4],
+                'status': row[5],
+                'created_at': row[6],
+                'last_notified_at': row[7],
+                'notification_count': row[8] if len(row) > 8 else 0
+            }
+            for row in results
+        ]
 
 
 def update_task_notification_time(task_id: int):
