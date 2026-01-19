@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Optional
 
 
-def setup_logger(name: str = "project_link") -> logging.Logger:
+def setup_logger(name: str = "project_link", log_file: Optional[str] = None) -> logging.Logger:
     """
-    设置并返回日志记录器（使用标准模式防止重复初始化）
+    设置并返回日志记录器（支持自定义日志文件）
     
     Args:
         name: 日志记录器名称
+        log_file: 自定义日志文件名（如 "daemon.log"），默认使用 "app.log"
     
     Returns:
         配置好的日志记录器
@@ -32,9 +33,10 @@ def setup_logger(name: str = "project_link") -> logging.Logger:
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
     
-    # 文件处理器（DEBUG 级别，记录所有日志）
-    log_file = log_dir / "app.log"
-    file_handler = logging.FileHandler(log_file, encoding='utf-8', mode='a')
+    # 文件处理器（使用自定义文件名或默认文件名）
+    log_file_name = log_file or "app.log"
+    log_file_path = log_dir / log_file_name
+    file_handler = logging.FileHandler(log_file_path, encoding='utf-8', mode='a')
     file_handler.setLevel(logging.DEBUG)
     
     # 终端处理器（INFO 级别，只显示重要信息）
@@ -56,15 +58,16 @@ def setup_logger(name: str = "project_link") -> logging.Logger:
     return logger
 
 
-def get_logger(name: str = "project_link") -> logging.Logger:
+def get_logger(name: str = "project_link", log_file: Optional[str] = None) -> logging.Logger:
     """
-    获取日志记录器（便捷函数）
+    获取日志记录器（支持自定义日志文件）
     
     Args:
         name: 日志记录器名称
+        log_file: 自定义日志文件名（如 "daemon.log"），默认使用 "app.log"
     
     Returns:
         日志记录器实例
     """
-    return setup_logger(name)
+    return setup_logger(name, log_file)
 

@@ -537,6 +537,61 @@ def update_task_notification_time(task_id: int):
         logger.debug(f"已更新任务 {task_id} 的通知时间和次数")
 
 
+def update_task_due_time(task_id: int, new_due_time: Optional[str]):
+    """
+    更新任务的到期时间
+    
+    Args:
+        task_id: 任务 ID
+        new_due_time: 新的到期时间（ISO 8601 格式，可为 None）
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tasks 
+            SET due_time = ?
+            WHERE id = ?
+        """, (new_due_time, task_id))
+        conn.commit()
+        logger.debug(f"已更新任务 {task_id} 的到期时间为: {new_due_time}")
+
+
+def get_task_by_id(task_id: int) -> Optional[Dict[str, Any]]:
+    """
+    根据 ID 获取单个任务
+    
+    Args:
+        task_id: 任务 ID
+    
+    Returns:
+        任务字典（包含所有字段），如果不存在返回 None
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, content, due_time, category, priority, status, created_at,
+                   last_notified_at, notification_count
+            FROM tasks
+            WHERE id = ?
+        """, (task_id,))
+        
+        row = cursor.fetchone()
+        if not row:
+            return None
+        
+        return {
+            'id': row[0],
+            'content': row[1],
+            'due_time': row[2],
+            'category': row[3],
+            'priority': row[4],
+            'status': row[5],
+            'created_at': row[6],
+            'last_notified_at': row[7],
+            'notification_count': row[8] if len(row) > 8 else 0
+        }
+
+
 def get_upcoming_tasks(hours: int = 24, status: str = 'pending') -> List[Dict[str, Any]]:
     """
     获取未来 N 小时内到期的任务
