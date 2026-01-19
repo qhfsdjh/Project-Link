@@ -104,6 +104,43 @@ def parse_due_time(due_time_str: Optional[str]) -> Optional[str]:
     return None
 
 
+def _is_backfill_past_intent(user_text: str) -> bool:
+    """
+    判断用户是否明确在“补记/回忆过去”的意图（允许 due_time 早于当前时间）
+    """
+    if not user_text:
+        return False
+    keywords = ("补记", "补录", "回忆", "回顾", "之前", "昨天", "上周", "上个月", "前天", "刚刚完成", "刚刚做了")
+    return any(k in user_text for k in keywords)
+
+
+def _is_time_correction_intent(user_text: str) -> bool:
+    """
+    判断用户是否在纠正时间（应该优先更新最近一个 pending 任务）
+    """
+    if not user_text:
+        return False
+    keywords = ("时间不对", "不对", "错了", "现在是", "现在已经", "怎么是", "穿越", "翻车")
+    return any(k in user_text for k in keywords)
+
+
+def _validate_due_time_not_past(due_time: Optional[str], now: datetime, user_text: str) -> bool:
+    """
+    硬性校验：除非用户明确补记/过去，否则 due_time 必须晚于 now
+    """
+    if not due_time:
+        return True
+    if _is_backfill_past_intent(user_text):
+        return True
+    try:
+        dt = parse_time(due_time)
+        # 允许 30 秒的容错（模型可能只精确到分钟）
+        return dt >= (now - timedelta(seconds=30))
+    except Exception:
+        # 无法解析时，交给上层当作无效处理
+        return False
+
+
 def validate_priority(priority: Any) -> int:
     """
     验证并规范化优先级
@@ -204,8 +241,14 @@ def get_ai_interpretation(user_input: str) -> Optional[Dict[str, Any]]:
     Returns:
         解析后的 JSON 对象，如果失败则返回 None
     """
+    # 统一使用本地时区（避免 UTC/本地混用）
+    now = datetime.now().astimezone()
+    current_time_iso = now.isoformat()
+
     # 从 prompts 模块获取提示词（自动注入当前时间信息）
     system_prompt = prompts.get_system_prompt()
+    # 调试增强：记录注入给 LLM 的 current_time
+    logger.info(f"[time_anchor] current_time_iso={current_time_iso}")
     
     # 启发式两段式：把最近 N 条 pending 任务作为候选上下文塞进 prompt
     recent_tasks = []
@@ -217,60 +260,83 @@ def get_ai_interpretation(user_input: str) -> Optional[Dict[str, Any]]:
     # 获取最近5轮对话历史（用于上下文感知和指代消解）
     conversation_history = get_recent_history(limit=5)
     
-    user_prompt = prompts.get_user_prompt(
-        user_input, 
+    base_user_prompt = prompts.get_user_prompt(
+        user_input,
         recent_tasks=recent_tasks,
         conversation_history=conversation_history
     )
-    
-    try:
-        # 使用 ollama.chat() API
-        response = ollama.chat(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            format="json",
-            options={
-                "temperature": config.PL_AI_TEMPERATURE,  # 从配置读取
-            }
-        )
-        
-        # 提取响应内容
-        # ChatResponse 对象支持字典式访问（response['message']['content']）
-        # 也支持属性访问（response.message.content）
+
+    # 强制时间校验 + 自动纠错重试（最多 2 次）
+    last_error_hint = ""
+    for attempt in range(2):
+        user_prompt = base_user_prompt
+        if last_error_hint:
+            user_prompt = (
+                base_user_prompt
+                + "\n\n【系统校验失败】\n"
+                + last_error_hint
+                + f"\n请基于 current_time_iso={current_time_iso} 重新计算并仅输出 JSON。\n"
+            )
+
         try:
-            # 优先使用字典式访问（更通用）
+            response = ollama.chat(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                format="json",
+                options={
+                    "temperature": config.PL_AI_TEMPERATURE,
+                }
+            )
+
+            # 提取响应内容
             if isinstance(response, dict):
                 response_text = response.get('message', {}).get('content', '')
             else:
-                # 使用属性访问
                 response_text = response.message.content if hasattr(response, 'message') else ''
-        except (AttributeError, TypeError, KeyError) as e:
-            logger.warning(f"无法提取响应内容: {e}")
-            print(f"⚠️  警告: 无法提取响应内容: {e}")
-            response_text = ''
-        
-        if not response_text:
-            logger.error("AI 返回空响应")
-            print("❌ AI 返回空响应")
-            return None
-        
-        # 解析 JSON
-        try:
-            logger.debug(f"AI 解析成功，返回 JSON: {json.loads(response_text)}")
-            return json.loads(response_text)
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON 解析失败: {e}，AI 返回的原始内容: {response_text[:200]}...")
-            print(f"❌ JSON 解析失败: {e}")
-            print(f"   AI 返回的原始内容: {response_text[:200]}...")
-            return None
-            
-    except Exception as e:
-        logger.error(f"调用 Ollama API 失败: {e}", exc_info=True)
-        print(f"❌ 调用 Ollama API 失败: {e}")
-        return None
+
+            # 调试增强：记录 LLM 原始返回（截断）
+            logger.info(f"[llm_raw] {response_text[:500]}")
+
+            if not response_text:
+                last_error_hint = "你返回了空响应。"
+                continue
+
+            try:
+                parsed = json.loads(response_text)
+            except json.JSONDecodeError as e:
+                last_error_hint = f"JSON 解析失败：{e}。你的输出必须是严格 JSON。"
+                continue
+
+            action = parsed.get("action")
+            data = parsed.get("data", {}) if isinstance(parsed.get("data"), dict) else {}
+
+            # 强制时间校验：add_task / update_task 的 due_time 不得早于当前时间（除非补记）
+            if action in ("add_task", "update_task") and isinstance(data, dict) and "due_time" in data:
+                due_time = parse_due_time(data.get("due_time"))
+                if due_time and not _validate_due_time_not_past(due_time, now, user_input):
+                    last_error_hint = (
+                        f"你计算出的 due_time={due_time} 早于当前时间 current_time_iso={current_time_iso}。"
+                        "除非用户明确说是补记/过去，否则 due_time 必须晚于当前时间。"
+                        "请重新计算相对时间（如“一分钟后/明天下午”等）并输出新的 due_time。"
+                    )
+                    continue
+
+                # 写回规范化后的 due_time
+                data["due_time"] = due_time
+                parsed["data"] = data
+
+            logger.debug(f"AI 解析成功，返回 JSON: {parsed}")
+            return parsed
+
+        except Exception as e:
+            logger.error(f"调用 Ollama API 失败: {e}", exc_info=True)
+            last_error_hint = f"调用失败：{e}"
+            continue
+
+    return None
 
 
 # ==================== 主逻辑 ====================
@@ -303,7 +369,22 @@ def process_user_input(user_text: str) -> bool:
     
     # 2. 让 AI 解析意图（支持上下文感知）
     logger.info(f"开始解析用户输入: {user_text[:50]}...")
-    result = get_ai_interpretation(user_text)
+
+    # 纠错意图识别升级：当用户说“时间不对/错了/现在是…”时，优先更新最近一个 pending 任务
+    user_text_for_ai = user_text
+    if _is_time_correction_intent(user_text):
+        try:
+            candidates = database.get_recent_tasks(status='pending', limit=1)
+        except Exception:
+            candidates = []
+        if candidates:
+            last_task = candidates[0]
+            user_text_for_ai = (
+                f"用户反馈上一个任务的时间不对。请对任务ID {last_task['id']} 执行 update_task，"
+                f"并基于当前时间重新计算正确的 due_time。用户原话：{user_text}"
+            )
+
+    result = get_ai_interpretation(user_text_for_ai)
     
     if not result:
         logger.warning("AI 解析失败，返回 None")
@@ -510,7 +591,12 @@ def process_user_input(user_text: str) -> bool:
                 changes.append(f"分类从 {old_cat} 改为 {new_cat}")
             
             if changes:
-                reply = f"没问题，已经帮你把刚才那项改为「{updated.get('content')}」了"
+                # 若是“时间纠错”场景，先道歉再确认
+                prefix = "抱歉，刚才我把时间算错了。"
+                if not _is_time_correction_intent(user_text):
+                    prefix = "没问题。"
+
+                reply = f"{prefix}我已经帮你把刚才那项更新为「{updated.get('content')}」了"
                 if updated.get("due_time"):
                     try:
                         dt = parse_time(updated.get("due_time"))
@@ -577,7 +663,7 @@ def process_user_input(user_text: str) -> bool:
             
             # 根据 time_range 查询任务
             tasks = []
-            now = datetime.now()
+            now = datetime.now().astimezone()
             
             if time_range == "today":
                 # 查询今天的任务（00:00:00 - 23:59:59）

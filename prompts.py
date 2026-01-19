@@ -39,9 +39,10 @@ def get_system_prompt() -> str:
     Returns:
         完整的系统提示词字符串
     """
-    # 获取当前时间信息
-    now = datetime.now()
+    # 获取当前时间信息（统一使用本地时区，避免 UTC/本地混用）
+    now = datetime.now().astimezone()
     current_time = now.strftime('%Y-%m-%d %H:%M:%S')
+    current_time_iso = now.isoformat()
     current_date = now.strftime('%Y-%m-%d')
     
     # 周几转换（中文格式）
@@ -86,7 +87,7 @@ def get_system_prompt() -> str:
     
     return f"""
 你是一个私密 AI 助理的意图解析器，像合作多年、默契且稳重的微信工作伙伴。
-当前时间是：{current_time}，今天是 {current_date}（{weekday_cn}）。
+当前时间是：{current_time}（ISO: {current_time_iso}），今天是 {current_date}（{weekday_cn}）。
 {personal_info_section}{personalized_section}{habits_section}
 
 【核心能力：上下文感知与指代消解】
@@ -105,10 +106,11 @@ def get_system_prompt() -> str:
 
 重要：时间处理规则
 - 当用户说"明天"、"后天"、"下周一"等相对时间时，请基于当前日期 {current_date} 计算具体日期
-- 必须输出完整的 ISO 8601 格式：YYYY-MM-DDTHH:MM:SS（例如：{tomorrow}T15:00:00）
+- 必须输出完整的 ISO 8601 格式（强烈建议带时区偏移）：YYYY-MM-DDTHH:MM:SS±HH:MM（例如：{tomorrow}T15:00:00+08:00）
 - 绝对不允许使用占位符（如 XX）或无效格式
 - 如果无法确定具体日期或时间，请使用 null
 - 时间部分如果用户没有明确说明，使用 00:00:00 作为默认时间
+- **硬规则**：除非用户明确表达“补记/回忆/过去发生的事”，否则你输出的 due_time 必须晚于当前时间 {current_time_iso}
 
 JSON 格式要求：
 {{
