@@ -6,6 +6,7 @@ Project Link - 意图解析翻译官
 import json
 import os
 import sys
+import random
 from typing import Optional, Dict, Any, Literal, Tuple, List
 from datetime import datetime, timedelta
 
@@ -70,6 +71,50 @@ def clear_history():
     """清空对话历史"""
     global _conversation_history
     _conversation_history = []
+
+
+def _get_last_ai_message() -> Optional[str]:
+    """获取最近一轮对话中的 AI 回复（如果有）"""
+    if not _conversation_history:
+        return None
+    last = _conversation_history[-1]
+    return last.get("ai")
+
+
+def _is_confirmation_intent(user_input: str, last_ai: Optional[str]) -> bool:
+    """
+    判断用户是否是在做简单的“确认/应答”，而不是发起新意图。
+    典型场景：
+    - 上一轮 AI 问：“这样对吗？”、“这样可以吗？”、“需要我改成这样吗？”
+    - 用户回：“对的”、“没错”、“OK”、“行”、“可以”、“好” 等极短肯定语。
+    """
+    if not user_input:
+        return False
+
+    text = user_input.strip().lower()
+    # 太长的一句话，就不当成简单确认，防止误判
+    if len(text) > 8:
+        return False
+
+    # 常见肯定短语（中/英）
+    positive_words = [
+        "对", "对的", "是", "是的", "没错", "行", "行啊", "行的",
+        "可以", "可以的", "好", "好的", "好呀", "好啦", "好嘞",
+        "嗯", "嗯嗯", "嗯好", "ok", "ok的", "okay", "确认", "确认了",
+        "成", "行了"
+    ]
+    # 去掉句末标点再比对
+    trimmed = text.rstrip("。！!～~啊呀呢吧嘛 ")
+    if trimmed in positive_words:
+        # 如果上一轮 AI 明显是在提问确认，就认为这是确认应答
+        if last_ai:
+            last = last_ai.strip()
+            if "对吗" in last or "对嘛" in last or "可以吗" in last or "需要我" in last or "要不要" in last or last.endswith("？") or last.endswith("?"):
+                return True
+        # 即便上一轮不是明显问句，也尽量宽容地视为“结束语”
+        return True
+
+    return False
 
 
 def _detect_track(user_input: str) -> TrackType:
@@ -600,6 +645,24 @@ def process_user_input(user_text: str) -> bool:
     # 轨道检测：区分日常快通道 / 会议长文本
     track: TrackType = _detect_track(user_text)
     logger.info(f"[track] current_track={track}")
+
+    # daily 轨道下增加“简单确认”意图识别：
+    # 如果上一轮 AI 正在确认，而本轮是极短的肯定语（对/OK/没错等），
+    # 直接给一句温和收尾，不再触发新的 update_task / add_task。
+    if track == "daily":
+        last_ai = _get_last_ai_message()
+        if _is_confirmation_intent(user_text, last_ai):
+            reply_candidates = [
+                "好哒，那就按这个来啦。",
+                "收到，我这边就按你刚才说的执行了。",
+                "没问题，就这么定了。",
+                "好的，我记住啦。",
+            ]
+            reply = random.choice(reply_candidates)
+            print(reply)
+            add_to_history(user_text, reply)
+            logger.info("[confirm_ok] 收到用户肯定回复，结束本轮对话（不再触发新的动作）")
+            return True
 
     # 1. 先记录原始对话（保存每一句记忆）
     # 注意：这里只记录原始输入，不记录 sentiment 和 tag
