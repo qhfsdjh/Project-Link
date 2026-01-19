@@ -85,9 +85,22 @@ def get_system_prompt() -> str:
         habits_section += "\n"
     
     return f"""
-你是一个私密 AI 助理的意图解析器。
+你是一个私密 AI 助理的意图解析器，像合作多年、默契且稳重的微信工作伙伴。
 当前时间是：{current_time}，今天是 {current_date}（{weekday_cn}）。
-{personal_info_section}{personalized_section}{habits_section}你的任务是将用户的输入转化为数据库操作指令。
+{personal_info_section}{personalized_section}{habits_section}
+
+【核心能力：上下文感知与指代消解】
+你必须通过最近5轮对话历史来理解用户的真实意图。当用户说"刚才那个"、"它"、"改一下"、"打错了"时，你需要：
+1. 回顾对话历史，找到用户最近提到的任务
+2. 自动识别修正意图（"打错了"/"改一下" = 对上一个任务的 update_task）
+3. 从候选任务中选择正确的 task_id（优先匹配最近创建且状态为 pending 的任务）
+
+【修正逻辑自动识别】
+- "打错了"、"改一下"、"刚才那个改成..." → 自动识别为 update_task，无需用户明确说"更新任务"
+- "取消上一个"、"把刚才那个取消" → 自动识别为 cancel_task
+- 如果对话历史中有明确的任务ID或内容，直接使用，不要要求用户重复说明
+
+你的任务是将用户的输入转化为数据库操作指令。
 输出必须是严格的 JSON 格式，不得包含任何解释文字。
 
 重要：时间处理规则
@@ -157,16 +170,41 @@ JSON 格式要求：
 """
 
 
-def get_user_prompt(user_input: str, recent_tasks: Optional[list] = None) -> str:
+def get_user_prompt(
+    user_input: str, 
+    recent_tasks: Optional[list] = None,
+    conversation_history: Optional[list] = None
+) -> str:
     """
-    获取用户提示词模板
+    获取用户提示词模板（支持对话历史和任务上下文）
     
     Args:
         user_input: 用户输入的自然语言
+        recent_tasks: 最近待办任务候选（用于指代消解）
+        conversation_history: 最近5轮对话历史（用于上下文感知）
     
     Returns:
         格式化的用户提示词
     """
+    # 构建对话历史部分
+    history_section = ""
+    if conversation_history and isinstance(conversation_history, list) and len(conversation_history) > 0:
+        lines = []
+        for i, entry in enumerate(conversation_history, 1):
+            user = entry.get("user", "")
+            ai = entry.get("ai", "")
+            if user:
+                lines.append(f"第{i}轮 - 用户: {user}")
+                if ai:
+                    lines.append(f"        AI: {ai}")
+        if lines:
+            history_section = (
+                "\n【最近对话历史（用于上下文感知和指代消解）】\n"
+                + "\n".join(lines)
+                + "\n\n重要：当用户说\"刚才那个\"、\"它\"、\"改一下\"、\"打错了\"时，必须结合对话历史理解真实意图。\n"
+            )
+    
+    # 构建任务候选部分
     context_section = ""
     if recent_tasks and isinstance(recent_tasks, list) and len(recent_tasks) > 0:
         lines = []
@@ -181,10 +219,10 @@ def get_user_prompt(user_input: str, recent_tasks: Optional[list] = None) -> str
                 continue
         if lines:
             context_section = (
-                "\n【最近待办候选（按创建时间倒序，优先用于“上一个/刚才那个”）】\n"
+                "\n【最近待办候选（按创建时间倒序，优先用于\"上一个/刚才那个\"）】\n"
                 + "\n".join(lines)
                 + "\n\n规则：如果 action 是 update_task 或 cancel_task，你必须从这些候选中选择 task_id（除非用户明确提供了任务ID）。\n"
             )
 
-    return f"{context_section}用户输入: \"{user_input}\"\n请输出 JSON:"
+    return f"{history_section}{context_section}用户输入: \"{user_input}\"\n请输出 JSON:"
 

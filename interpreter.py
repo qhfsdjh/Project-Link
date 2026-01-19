@@ -13,6 +13,7 @@ import database  # 导入数据库模块
 import prompts  # 导入提示词模块
 import config  # 导入配置模块
 from utils.logger import get_logger  # 导入日志模块
+from utils.helpers import parse_time  # 导入时间解析工具
 
 # 初始化日志记录器
 logger = get_logger("interpreter")
@@ -30,6 +31,42 @@ MODEL_NAME = config.OLLAMA_MODEL
 TIMEOUT = config.OLLAMA_TIMEOUT
 MAX_RETRIES = config.PL_AI_MAX_RETRIES
 RETRY_DELAY = config.PL_AI_RETRY_DELAY
+
+# ==================== 对话历史缓存（最近5轮）====================
+# 用于上下文感知和指代消解（"刚才那个"、"它"、"改一下"等）
+_conversation_history = []
+
+def add_to_history(user_input: str, ai_response: Optional[str] = None):
+    """
+    添加对话到历史记录（最多保留最近5轮）
+    
+    Args:
+        user_input: 用户输入
+        ai_response: AI 回复（可选，用于完整对话记录）
+    """
+    global _conversation_history
+    entry = {"user": user_input, "ai": ai_response}
+    _conversation_history.append(entry)
+    # 只保留最近5轮
+    if len(_conversation_history) > 5:
+        _conversation_history = _conversation_history[-5:]
+
+def get_recent_history(limit: int = 5) -> list:
+    """
+    获取最近N轮对话历史
+    
+    Args:
+        limit: 返回的轮数（默认5）
+    
+    Returns:
+        对话历史列表（从旧到新）
+    """
+    return _conversation_history[-limit:]
+
+def clear_history():
+    """清空对话历史"""
+    global _conversation_history
+    _conversation_history = []
 
 # ==================== 工具函数 ====================
 
@@ -159,7 +196,7 @@ def validate_action_data(result: Optional[Dict[str, Any]]) -> Tuple[Optional[str
 
 def get_ai_interpretation(user_input: str) -> Optional[Dict[str, Any]]:
     """
-    调用 Ollama 让 Qwen 解析用户的真实意图
+    调用 Ollama 让 Qwen 解析用户的真实意图（支持上下文感知）
     
     Args:
         user_input: 用户输入的自然语言
@@ -169,13 +206,22 @@ def get_ai_interpretation(user_input: str) -> Optional[Dict[str, Any]]:
     """
     # 从 prompts 模块获取提示词（自动注入当前时间信息）
     system_prompt = prompts.get_system_prompt()
+    
     # 启发式两段式：把最近 N 条 pending 任务作为候选上下文塞进 prompt
     recent_tasks = []
     try:
         recent_tasks = database.get_recent_tasks(status='pending', limit=3)
     except Exception as e:
         logger.warning(f"获取最近任务候选失败: {e}")
-    user_prompt = prompts.get_user_prompt(user_input, recent_tasks=recent_tasks)
+    
+    # 获取最近5轮对话历史（用于上下文感知和指代消解）
+    conversation_history = get_recent_history(limit=5)
+    
+    user_prompt = prompts.get_user_prompt(
+        user_input, 
+        recent_tasks=recent_tasks,
+        conversation_history=conversation_history
+    )
     
     try:
         # 使用 ollama.chat() API
@@ -255,24 +301,26 @@ def process_user_input(user_text: str) -> bool:
         print(f"⚠️  警告: 记录原始输入失败: {e}")
         # 继续执行，不因为记录失败而中断
     
-    # 2. 让 AI 解析意图
+    # 2. 让 AI 解析意图（支持上下文感知）
     logger.info(f"开始解析用户输入: {user_text[:50]}...")
-    print("🧠 正在思考...")
     result = get_ai_interpretation(user_text)
     
     if not result:
         logger.warning("AI 解析失败，返回 None")
-        print("❌ 我没听懂，请换种说法。")
+        print("嗯，我没太理解，能换个说法吗？")
         return False
     
     # 3. 验证 JSON 结构
     action, data = validate_action_data(result)
     if not action or not data:
         logger.error("解析结果格式不正确")
-        print("❌ 解析结果格式不正确。")
+        print("抱歉，解析出错了，能再说一遍吗？")
         return False
     
     logger.info(f"AI 解析成功，action: {action}")
+    
+    # 记录到对话历史（用于下一轮的上下文感知）
+    add_to_history(user_text)
     
     # 4. 根据意图执行数据库操作
     try:
@@ -280,7 +328,7 @@ def process_user_input(user_text: str) -> bool:
             # 验证和规范化数据
             content = data.get("content")
             if not content:
-                print("❌ 任务内容不能为空")
+                print("任务内容不能为空哦")
                 return False
             
             due_time = parse_due_time(data.get("due_time"))
@@ -295,9 +343,20 @@ def process_user_input(user_text: str) -> bool:
                 priority=priority
             )
             logger.info(f"任务已添加: task_id={task_id}, content={content}, due_time={due_time}, priority={priority}")
-            print(f"✅ 已存入任务 (ID: {task_id}): {content}")
+            
+            # 自然口语风格回复
             if due_time:
-                print(f"   截止时间: {due_time}")
+                try:
+                    dt = parse_time(due_time)
+                    time_str = dt.strftime('%m月%d日 %H:%M')
+                    print(f"好哒，已经记下了：{content}，截止时间是 {time_str}")
+                except:
+                    print(f"好哒，已经记下了：{content}")
+            else:
+                print(f"好哒，已经记下了：{content}")
+            
+            # 记录到对话历史
+            add_to_history(user_text, f"已添加任务：{content}")
             return True
             
         elif action == "add_preference":
@@ -307,7 +366,7 @@ def process_user_input(user_text: str) -> bool:
             source = data.get("source", "AI推断")
             
             if not key or not value:
-                print("❌ 偏好键名和值不能为空")
+                print("偏好键名和值不能为空哦")
                 return False
             
             # 验证 source
@@ -322,7 +381,8 @@ def process_user_input(user_text: str) -> bool:
                 boost=config.PL_HABIT_BOOST  # 从配置读取
             )
             logger.info(f"习惯已更新: key={key}, value={value}, source={source}, boost={config.PL_HABIT_BOOST}")
-            print(f"💡 我学到了一个新习惯: {key} -> {value}")
+            print(f"好的，我记住了：{key} -> {value}")
+            add_to_history(user_text, f"已学习习惯：{key} -> {value}")
             return True
             
         elif action == "record_memory":
@@ -336,7 +396,8 @@ def process_user_input(user_text: str) -> bool:
                 try:
                     database.update_interaction(raw_record_id, sentiment, tag)
                     logger.info(f"记忆已更新: record_id={raw_record_id}, sentiment={sentiment}, tag={tag}")
-                    print(f"🧠 已存入深度记忆 (情感: {sentiment}, 标签: {tag or '无'})")
+                    print("好的，我记住了")
+                    add_to_history(user_text, "已记录记忆")
                 except Exception as e:
                     logger.warning(f"更新记忆记录失败: {e}")
                     print(f"⚠️  警告: 更新记忆记录失败: {e}")
@@ -346,7 +407,8 @@ def process_user_input(user_text: str) -> bool:
                 try:
                     database.record_interaction(user_text, sentiment, tag)
                     logger.info(f"记忆已记录: sentiment={sentiment}, tag={tag}")
-                    print(f"🧠 已存入深度记忆 (情感: {sentiment}, 标签: {tag or '无'})")
+                    print("好的，我记住了")
+                    add_to_history(user_text, "已记录记忆")
                 except Exception as e:
                     logger.warning(f"记录记忆失败: {e}")
                     print(f"⚠️  警告: 记录记忆失败: {e}")
@@ -365,18 +427,18 @@ def process_user_input(user_text: str) -> bool:
                 if len(candidates) == 1:
                     task_id = candidates[0]["id"]
                 else:
-                    print("❌ 无法确定要修改哪个任务：请明确任务 ID，或说“修改上一个任务…”。")
+                    print("无法确定要修改哪个任务，能明确一下任务 ID 吗？或者说“修改上一个任务…”")
                     return False
 
             try:
                 task_id = int(task_id)
             except (ValueError, TypeError):
-                print("❌ task_id 必须是整数")
+                print("task_id 必须是整数哦")
                 return False
 
             old = database.get_task_by_id(task_id)
             if not old:
-                print(f"❌ 找不到任务 ID {task_id}")
+                print(f"找不到任务 ID {task_id}，可能已经被删除了")
                 return False
 
             # 允许部分字段更新
@@ -389,7 +451,7 @@ def process_user_input(user_text: str) -> bool:
 
             if "content" in data:
                 if not isinstance(new_content, str) or not new_content.strip():
-                    print("❌ 新任务内容不能为空")
+                    print("新任务内容不能为空哦")
                     return False
                 if new_content.strip() != old.get("content"):
                     database.update_task_content(task_id, new_content.strip())
@@ -416,23 +478,52 @@ def process_user_input(user_text: str) -> bool:
                 did_update = True
 
             if not did_update:
-                print(f"⚠️  任务 ID {task_id} 没有实际变更（可能是字段未提供或与原值相同）")
+                print("好的，任务没有实际变更（可能字段未提供或与原值相同）")
+                add_to_history(user_text, "任务无变更")
                 return True
 
             updated = database.get_task_by_id(task_id)
             if not updated:
-                print(f"✅ 已更新任务 ID {task_id}（但读取更新后数据失败）")
+                print("好的，已经更新了（但读取更新后数据失败）")
+                add_to_history(user_text, "已更新任务")
                 return True
 
-            # 清晰反馈（前后对比）
+            # 自然口语风格反馈（前后对比，闭环确认）
+            changes = []
             if updated.get("content") != old.get("content"):
-                print(f"✅ 已将任务 ID {task_id} 的标题从「{old.get('content')}」修改为「{updated.get('content')}」")
+                changes.append(f"标题从「{old.get('content')}」改为「{updated.get('content')}」")
             if updated.get("due_time") != old.get("due_time"):
-                print(f"✅ 已将任务 ID {task_id} 的截止时间从 {old.get('due_time')} 修改为 {updated.get('due_time')}")
+                old_time = old.get("due_time") or "无"
+                new_time = updated.get("due_time") or "无"
+                if new_time != "无":
+                    try:
+                        dt = parse_time(new_time)
+                        new_time = dt.strftime('%m月%d日 %H:%M')
+                    except:
+                        pass
+                changes.append(f"时间从 {old_time} 改为 {new_time}")
             if updated.get("priority") != old.get("priority"):
-                print(f"✅ 已将任务 ID {task_id} 的优先级从 {old.get('priority')} 修改为 {updated.get('priority')}")
+                changes.append(f"优先级从 {old.get('priority')} 改为 {updated.get('priority')}")
             if updated.get("category") != old.get("category"):
-                print(f"✅ 已将任务 ID {task_id} 的分类从 {old.get('category')} 修改为 {updated.get('category')}")
+                old_cat = old.get("category") or "无"
+                new_cat = updated.get("category") or "无"
+                changes.append(f"分类从 {old_cat} 改为 {new_cat}")
+            
+            if changes:
+                reply = f"没问题，已经帮你把刚才那项改为「{updated.get('content')}」了"
+                if updated.get("due_time"):
+                    try:
+                        dt = parse_time(updated.get("due_time"))
+                        time_str = dt.strftime('%m月%d日 %H:%M')
+                        reply += f"，时间设在 {time_str}"
+                    except:
+                        pass
+                reply += "，这样对吗？"
+                print(reply)
+                add_to_history(user_text, reply)
+            else:
+                print("好的，已经更新了")
+                add_to_history(user_text, "已更新任务")
 
             return True
 
@@ -448,27 +539,34 @@ def process_user_input(user_text: str) -> bool:
                 if candidates:
                     task_id = candidates[0]["id"]
                 else:
-                    print("❌ 没有可取消的 pending 任务")
+                    print("没有可取消的待办任务")
                     return False
 
             try:
                 task_id = int(task_id)
             except (ValueError, TypeError):
-                print("❌ task_id 必须是整数")
+                print("task_id 必须是整数哦")
                 return False
 
             old = database.get_task_by_id(task_id)
             if not old:
-                print(f"❌ 找不到任务 ID {task_id}")
+                print(f"找不到任务 ID {task_id}，可能已经被删除了")
                 return False
 
             database.cancel_task(task_id)
-            print(f"✅ 已取消任务 ID {task_id}: {old.get('content')}")
+            print(f"好的，已经取消「{old.get('content')}」了")
+            add_to_history(user_text, f"已取消任务：{old.get('content')}")
             return True
 
         elif action == "chat":
-            reply = data.get("reply") if isinstance(data, dict) else None
-            print(reply or "👌")
+            # 纯聊天/情绪表达（不存任务/改任务/查任务）
+            reply = data.get("reply", "")
+            if reply:
+                print(reply)
+                add_to_history(user_text, reply)
+            else:
+                print("好的，我明白了")
+                add_to_history(user_text, "好的，我明白了")
             return True
 
         elif action == "query_tasks":
@@ -511,18 +609,19 @@ def process_user_input(user_text: str) -> bool:
             
             logger.info(f"查询任务成功: time_range={time_range}, status={status_filter}, 找到 {len(tasks)} 个任务")
             
-            # 格式化输出（简单格式化）
+            # 自然口语风格输出
             if not tasks:
                 if time_range == "today":
-                    print("📋 你今天没有任务")
+                    print("今天暂时没有任务")
                 elif time_range == "tomorrow":
-                    print("📋 你明天没有任务")
+                    print("明天暂时没有任务")
                 elif time_range == "upcoming":
-                    print("📋 未来 24 小时内没有即将到期的任务")
+                    print("未来 24 小时内没有即将到期的任务")
                 elif time_range == "overdue":
-                    print("📋 没有过期未完成的任务")
+                    print("没有过期未完成的任务")
                 else:
-                    print("📋 没有找到任务")
+                    print("暂时没有找到任务")
+                add_to_history(user_text, "查询任务：无结果")
             else:
                 # 格式化任务列表
                 time_range_names = {
@@ -533,32 +632,56 @@ def process_user_input(user_text: str) -> bool:
                     "all": "所有"
                 }
                 range_name = time_range_names.get(time_range, "指定时间")
-                print(f"📋 你{range_name}有 {len(tasks)} 个任务：")
+                print(f"{range_name}有 {len(tasks)} 个任务：")
                 
                 for i, task in enumerate(tasks, 1):
                     due_time_str = ""
                     if task['due_time']:
                         try:
                             # 解析 ISO 格式时间并格式化显示
-                            due_dt = datetime.fromisoformat(task['due_time'])
+                            due_dt = datetime.fromisoformat(task['due_time'].replace('Z', '+00:00'))
                             due_time_str = f" ({due_dt.strftime('%m月%d日 %H:%M')})"
                         except:
                             due_time_str = f" ({task['due_time']})"
                     
                     priority_str = "⭐" * task['priority']
                     print(f"  {i}. {task['content']}{due_time_str} {priority_str}")
+                
+                add_to_history(user_text, f"查询到 {len(tasks)} 个任务")
             
             return True
         
         else:
             logger.error(f"未知的 action: {action}")
-            print(f"❌ 未知的 action: {action}")
+            print("抱歉，这个操作我暂时处理不了")
             return False
             
     except Exception as e:
         logger.error(f"数据库操作失败: {e}", exc_info=True)
-        print(f"❌ 数据库操作失败: {e}")
+        print(f"处理出错了: {e}")
         return False
+
+
+def get_clipboard_text() -> Optional[str]:
+    """
+    读取系统剪切板内容（macOS）
+    
+    Returns:
+        剪切板文本内容，如果失败则返回 None
+    """
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["pbpaste"],
+            capture_output=True,
+            text=True,
+            timeout=1
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 
 def main():
@@ -572,14 +695,21 @@ def main():
     print("提示: 输入 'exit' 或 'quit' 退出")
     print()
     
+    # 启动时读取剪切板作为参考上下文（可选）
+    clipboard_text = get_clipboard_text()
+    if clipboard_text:
+        # 将剪切板内容作为初始上下文提示（不自动处理，仅作为参考）
+        print(f"💡 检测到剪切板内容（仅供参考）: {clipboard_text[:50]}{'...' if len(clipboard_text) > 50 else ''}")
+        print()
+    
     # 确保数据库已初始化
     try:
         database.init_db()
         logger.info("数据库初始化成功")
-        print("✅ 数据库已就绪\n")
+        print("数据库已就绪\n")
     except Exception as e:
         logger.error(f"数据库初始化失败: {e}", exc_info=True)
-        print(f"❌ 数据库初始化失败: {e}")
+        print(f"数据库初始化失败: {e}")
         print("   请检查 database.py 和 app.db")
         return
     
@@ -610,7 +740,7 @@ def main():
             break
         except Exception as e:
             logger.error(f"发生未预期的错误: {e}", exc_info=True)
-            print(f"\n❌ 发生未预期的错误: {e}")
+            print(f"\n抱歉，出错了: {e}")
             print("   程序将继续运行...\n")
 
 

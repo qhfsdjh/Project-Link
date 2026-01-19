@@ -10,6 +10,7 @@ import os
 import signal
 import sys
 import sqlite3
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
@@ -37,8 +38,17 @@ class ProjectLinkApp(rumps.App):
         self.quit_button = None
 
         # 创建固定菜单项（后续 update_menu 会重建整个菜单）
+        # 注意：rumps 支持菜单项快捷键（如 Cmd+Q），但全局快捷键需要系统权限
+        # 全局快捷键可以通过 macOS "系统设置 > 键盘 > 快捷键 > 应用快捷键" 配置
         self.quick_chat_item = rumps.MenuItem("快速对话", callback=self.start_quick_chat)
         self.menu = [self.quick_chat_item]
+        
+        # 尝试注册全局快捷键（需要辅助功能权限）
+        # 注意：这需要用户在"系统设置 > 隐私与安全性 > 辅助功能"中授权
+        try:
+            self._setup_global_hotkey()
+        except Exception as e:
+            logger.debug(f"全局快捷键设置失败（可能需要权限）: {e}")
 
         # 使用 rumps.Timer 确保所有 UI 操作在主线程执行（Cocoa/rumps 的硬要求）
         self.menu_timer = rumps.Timer(self.update_menu, config.PL_DAEMON_MENU_UPDATE_INTERVAL)
@@ -120,6 +130,7 @@ class ProjectLinkApp(rumps.App):
 
             # 底部固定区
             self.menu.add(None)
+            self.menu.add(rumps.MenuItem("快速输入", callback=lambda _: self.show_quick_input()))
             self.menu.add(rumps.MenuItem("退出", callback=self.quit_application))
                 
         finally:
@@ -210,15 +221,42 @@ class ProjectLinkApp(rumps.App):
         else:
             return notification_count == 0
     
+    def _extract_link_or_path(self, content: str) -> Optional[str]:
+        """
+        从任务内容中提取链接或文件路径
+        
+        Args:
+            content: 任务内容
+        
+        Returns:
+            链接或文件路径，如果没有则返回 None
+        """
+        if not content:
+            return None
+        
+        # 检测 HTTP/HTTPS 链接
+        url_pattern = r'https?://[^\s]+'
+        match = re.search(url_pattern, content)
+        if match:
+            return match.group(0)
+        
+        # 检测文件路径（macOS 路径格式：/Users/... 或 ~/...）
+        path_pattern = r'(?:/Users/|~/|/Volumes/)[^\s]+'
+        match = re.search(path_pattern, content)
+        if match:
+            return match.group(0)
+        
+        return None
+    
     def show_task_dialog(self, task_id: int) -> Optional[str]:
         """
-        显示任务对话框（置顶优化）
+        显示任务对话框（置顶优化，支持链接/文件路径检测）
         
         Args:
             task_id: 任务 ID
         
         Returns:
-            "完成", "推迟", "暂时忽略", 或 None（超时/取消）
+            "完成", "推迟", "暂时忽略", "立即前往", 或 None（超时/取消）
         """
         try:
             task = database.get_task_by_id(task_id)
@@ -238,11 +276,22 @@ class ProjectLinkApp(rumps.App):
             message = f"任务提醒:\\n{task.get('content')}\\n截止：{due_display}"
             message_escaped = escape_apple_script(message)
             
+            # 检测任务内容是否包含链接/文件路径
+            link_or_path = self._extract_link_or_path(task.get('content', ''))
+            
+            # 根据是否有链接决定按钮列表
+            if link_or_path:
+                buttons = ["完成", "推迟", "立即前往", "暂时忽略"]
+            else:
+                buttons = ["完成", "推迟", "暂时忽略"]
+            
+            buttons_str = "{" + ", ".join([f'"{b}"' for b in buttons]) + "}"
+            
             # 构建 AppleScript（置顶优化）
             script = f'''
             tell application "System Events" to activate
             try
-                set theAnswer to display dialog "{message_escaped}" buttons {{"完成", "推迟", "暂时忽略"}} default button "暂时忽略"
+                set theAnswer to display dialog "{message_escaped}" buttons {buttons_str} default button "暂时忽略"
                 return button returned of theAnswer
             on error
                 return "暂时忽略"
@@ -259,7 +308,7 @@ class ProjectLinkApp(rumps.App):
             response = result.stdout.strip()
             
             # 验证返回值
-            valid_responses = ["完成", "推迟", "暂时忽略"]
+            valid_responses = ["完成", "推迟", "暂时忽略", "立即前往"]
             if response in valid_responses:
                 logger.info(f"用户选择: {response} (任务 {task_id})")
                 return response
@@ -314,6 +363,24 @@ class ProjectLinkApp(rumps.App):
                 # “暂时忽略”的语义：仅更新 last_notified_at（触发冷却），不改 due_time / 不改 status
                 database.update_task_notification_time(task_id)
                 logger.info(f"任务 {task_id} 暂时忽略（仅更新 last_notified_at）")
+            
+            elif response == "立即前往":
+                # 一键跳转：打开链接或文件
+                task = database.get_task_by_id(task_id)
+                if task:
+                    link_or_path = self._extract_link_or_path(task.get('content', ''))
+                    if link_or_path:
+                        try:
+                            # 使用 macOS 的 open 命令打开链接或文件
+                            subprocess.run(["open", link_or_path], check=False, timeout=5)
+                            logger.info(f"已打开链接/文件: {link_or_path} (任务 {task_id})")
+                            # 打开后更新通知时间（视为"已处理"）
+                            database.update_task_notification_time(task_id)
+                        except Exception as e:
+                            logger.error(f"打开链接/文件失败: {e} (任务 {task_id})")
+                            rumps.alert("错误", f"无法打开: {link_or_path}")
+                    else:
+                        logger.warning(f"任务 {task_id} 内容中未找到链接或文件路径")
             
             else:
                 logger.warning(f"未知的对话框响应: {response} (任务 {task_id})")
@@ -396,6 +463,50 @@ class ProjectLinkApp(rumps.App):
         except Exception as e:
             logger.error(f"推迟任务失败 (任务 {task_id}): {e}", exc_info=True)
             return False
+    
+    def _setup_global_hotkey(self):
+        """
+        设置全局快捷键（唤起极简输入框）
+        注意：macOS 需要辅助功能权限，如果失败则降级为菜单项快捷键
+        """
+        # 方案1：使用 pynput（需要安装：pip install pynput）
+        # 方案2：使用 macOS 系统快捷键配置（推荐，无需额外权限）
+        # 这里先预留接口，实际实现可以通过系统设置配置
+        pass
+    
+    def show_quick_input(self):
+        """
+        显示极简输入框（通过菜单项或全局快捷键调用）
+        使用 rumps.Window 在主线程弹出输入框
+        """
+        try:
+            window = rumps.Window(
+                message="快速输入任务：",
+                default_text="",
+                title="Project Link 快速输入",
+                ok="确定",
+                cancel="取消",
+                dimensions=(400, 50)
+            )
+            response = window.run()
+            
+            if response.clicked == 1:  # 点击了"确定"
+                user_input = response.text.strip()
+                if user_input:
+                    # 调用 interpreter 处理输入（需要在后台线程执行，避免阻塞 UI）
+                    import threading
+                    def process_in_background():
+                        try:
+                            import interpreter
+                            interpreter.process_user_input(user_input)
+                        except Exception as e:
+                            logger.error(f"处理快速输入失败: {e}", exc_info=True)
+                    
+                    thread = threading.Thread(target=process_in_background, daemon=True)
+                    thread.start()
+                    logger.info(f"快速输入已提交: {user_input[:50]}...")
+        except Exception as e:
+            logger.error(f"显示快速输入框失败: {e}", exc_info=True)
     
     def start_quick_chat(self, _):
         """打开新的终端窗口运行 interpreter.py"""
