@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import random
+import re
 from typing import Optional, Dict, Any, Literal, Tuple, List
 from datetime import datetime, timedelta
 
@@ -318,6 +319,68 @@ def _is_time_correction_intent(user_text: str) -> bool:
         return False
     keywords = ("时间不对", "不对", "错了", "现在是", "现在已经", "怎么是", "穿越", "翻车")
     return any(k in user_text for k in keywords)
+
+
+def _is_content_correction_intent(user_text: str) -> bool:
+    """
+    判断用户是否在纠正任务内容（如"不是...是..."、"事情也要改"、"内容也要改"）
+    """
+    if not user_text:
+        return False
+    # 明确的内容修正关键词
+    keywords = (
+        "不是", "不是我说", "不是这个", "不是那个",
+        "事情也要改", "内容也要改", "干的事情也要改", "要做的事情也要改",
+        "改成", "改为", "改成", "改成",
+        "我说错了", "打错了", "记错了"
+    )
+    return any(k in user_text for k in keywords)
+
+
+def _extract_new_content_from_correction(user_text: str) -> Optional[str]:
+    """
+    从用户修正输入中提取新任务内容
+    例如："不是我说错了 是5分钟之后提醒我修改schema" -> "修改schema"
+          "不对我干的事情也要改" -> 如果上下文有"提醒我修改schema"，提取"修改schema"
+    """
+    if not user_text:
+        return None
+    
+    # 模式1: "不是...是..." 或 "不是...，是..."
+    patterns = [
+        r"不是[^，。！？]*[，,]?\s*是\s*(.+?)(?:\s|$|，|。|！|？)",
+        r"不是[^，。！？]*[，,]?\s*要\s*(.+?)(?:\s|$|，|。|！|？)",
+        r"提醒我\s*(.+?)(?:\s|$|，|。|！|？)",
+        r"要\s*(.+?)(?:\s|$|，|。|！|？)",
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, user_text)
+        if match:
+            extracted = match.group(1).strip()
+            # 清理时间表达（如"5分钟之后"、"明天"等）
+            time_patterns = [
+                r"\d+\s*分钟之后",
+                r"\d+\s*小时之后",
+                r"明天",
+                r"后天",
+                r"下周",
+                r"之后",
+                r"之后提醒我",
+            ]
+            for tp in time_patterns:
+                extracted = re.sub(tp, "", extracted, flags=re.IGNORECASE).strip()
+            if extracted and len(extracted) > 1:
+                return extracted
+    
+    # 模式2: 如果包含"修改/改" + 具体内容
+    if "修改" in user_text or "改" in user_text:
+        # 尝试提取"修改XXX"或"改XXX"
+        match = re.search(r"(?:修改|改)\s*([^，。！？\s]+)", user_text)
+        if match:
+            return match.group(1).strip()
+    
+    return None
 
 
 def _validate_due_time_not_past(due_time: Optional[str], now: datetime, user_text: str) -> bool:
@@ -856,6 +919,15 @@ def process_user_input(user_text: str) -> bool:
             new_due_time = parse_due_time(data.get("due_time")) if "due_time" in data else None
             new_priority = validate_priority(data.get("priority")) if "priority" in data else None
             new_category = data.get("category") if "category" in data else None
+
+            # 【内容修正兜底逻辑】如果用户明确说要改内容，但 LLM 没有输出 content，强制从用户输入提取
+            if _is_content_correction_intent(user_text) and (not new_content or new_content == old.get("content")):
+                extracted_content = _extract_new_content_from_correction(user_text)
+                if extracted_content and extracted_content != old.get("content"):
+                    logger.info(f"[content_correction] 检测到内容修正意图，从用户输入提取新内容: {extracted_content}")
+                    new_content = extracted_content
+                    # 强制标记需要更新 content
+                    data["content"] = new_content
 
             did_update = False
 
