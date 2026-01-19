@@ -1,0 +1,37 @@
+"""
+Project Link - 本地个性化提示词配置（模板）
+复制此文件为 prompts_local.py 并自定义你的个性化内容
+prompts_local.py 已被 .gitignore 忽略，不会被提交到 Git
+"""
+
+# ==================== 用户信息 ====================
+USER_NAME = None  # 例如: "张三" - AI 可能会以此称呼你
+USER_CONTEXT = None  # 例如: "一名追求效率的开发者，喜欢简洁明了的指令，习惯晚睡早起。"
+
+# ==================== 个性化提示词片段 ====================
+PERSONALIZED_INSTRUCTIONS = """
+### 1. 时间偏好定义
+- 我的"早晨"指 07:00 - 09:00
+- 我的"深夜"指 23:00 - 02:00
+- 如果我没说具体时间，默认的"下午"任务请设为 15:00
+
+### 2. 任务分类逻辑
+- 涉及代码、GitHub、Cursor 的任务归类为 "Work"
+- 涉及买菜、健身、休息的任务归类为 "Life"
+- 任何关于"提醒我喝水"或"休息一下"的任务，优先级(priority)设为 4
+
+### 3. 记忆提取偏好
+- 当我表达情绪（如"太累了"、"真开心"）时，请务必在 record_memory 中记录 sentiment。
+- 自动提取我提到的技术关键词（如 Python, SQLite, Ollama）作为 tag。
+"""
+
+# ==================== 学习到的习惯（未来由 AI 自动填充）====================
+# 这个区域将在 Phase 3 中由 AI 自动分析和填充
+# 目前可以手动填写，格式：{"key": "习惯键名", "value": "习惯值", "confidence": 0.8}
+LEARNED_HABITS = []
+# 示例：
+# LEARNED_HABITS = [
+#     {"key": "morning_routine", "value": "喝咖啡", "confidence": 0.9},
+#     {"key": "work_hours", "value": "9-18", "confidence": 0.85},
+# ]
+

@@ -28,4 +28,27 @@ Thumbs.db
 # Environment variables
 .env
 .env.local
+.env.*
+!.env.example
+
+# 本地个性化配置（如果使用）
+prompts_local.py
+config_local.py
+*.local.py
+
+# 数据库相关（已包含，再次确认）
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# 日志文件（可能包含敏感信息）
+*.log
+logs/
+
+# 临时文件和备份
+*.bak
+*.tmp
+*~
 
