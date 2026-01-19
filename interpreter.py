@@ -6,7 +6,7 @@ Project Link - 意图解析翻译官
 import json
 import os
 import sys
-from typing import Optional, Dict, Any, Literal, Tuple
+from typing import Optional, Dict, Any, Literal, Tuple, List
 from datetime import datetime, timedelta
 
 import database  # 导入数据库模块
@@ -139,6 +139,92 @@ def _validate_due_time_not_past(due_time: Optional[str], now: datetime, user_tex
     except Exception:
         # 无法解析时，交给上层当作无效处理
         return False
+
+
+def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
+    """
+    从 LLM 输出中提取第一段 JSON 对象并解析。
+    兼容“JSON 后面夹带解释文字”的情况。
+    """
+    if not text:
+        return None
+    # 先快路径：整段就是 JSON
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # 慢路径：括号配对截取首个 JSON 对象
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "\"":
+                in_str = False
+            continue
+        else:
+            if ch == "\"":
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    snippet = text[start:i+1]
+                    try:
+                        obj = json.loads(snippet)
+                        if isinstance(obj, dict):
+                            return obj
+                    except Exception:
+                        return None
+    return None
+
+
+def _pick_recent_pending(limit: int = 5) -> List[Dict[str, Any]]:
+    """获取最近 pending 候选（created_at 倒序）。"""
+    try:
+        return database.get_recent_tasks(status='pending', limit=limit)
+    except Exception:
+        return []
+
+
+def _normalize_task_id(task_id: Optional[Any], candidates: List[Dict[str, Any]]) -> Optional[int]:
+    """
+    纠偏 task_id：如果不在候选列表里，返回候选第一条（最近 pending）。
+    """
+    if not candidates:
+        return None
+    ids = {t.get("id") for t in candidates}
+    try:
+        tid = int(task_id) if task_id is not None else None
+    except (ValueError, TypeError):
+        tid = None
+    if tid in ids:
+        return tid
+    return candidates[0].get("id")
+
+
+def _is_completion_intent(user_text: str) -> bool:
+    """
+    判断用户是否在表达“已完成/已做完/已喝了”等完成意图。
+    """
+    if not user_text:
+        return False
+    completion_keywords = ("我已经", "我已", "搞定了", "做完了", "完成了", "喝了", "喝完了", "已经处理", "处理好了")
+    cancel_keywords = ("取消", "不要了", "算了", "撤销")
+    return any(k in user_text for k in completion_keywords) and not any(k in user_text for k in cancel_keywords)
 
 
 def validate_priority(priority: Any) -> int:
@@ -304,10 +390,9 @@ def get_ai_interpretation(user_input: str) -> Optional[Dict[str, Any]]:
                 last_error_hint = "你返回了空响应。"
                 continue
 
-            try:
-                parsed = json.loads(response_text)
-            except json.JSONDecodeError as e:
-                last_error_hint = f"JSON 解析失败：{e}。你的输出必须是严格 JSON。"
+            parsed = _extract_first_json(response_text)
+            if not parsed:
+                last_error_hint = "JSON 解析失败：你必须输出严格 JSON，且不要在 JSON 后追加解释文字。"
                 continue
 
             action = parsed.get("action")
@@ -369,6 +454,22 @@ def process_user_input(user_text: str) -> bool:
     
     # 2. 让 AI 解析意图（支持上下文感知）
     logger.info(f"开始解析用户输入: {user_text[:50]}...")
+
+    # 完成意图兜底：像“我已经喝了/做完了”这种，优先标记最近 pending 为 done（不走 cancel）
+    if _is_completion_intent(user_text):
+        candidates = _pick_recent_pending(limit=5)
+        if candidates:
+            tid = candidates[0].get("id")
+            task = database.get_task_by_id(tid) if tid is not None else None
+            if task:
+                try:
+                    database.update_task_status(int(tid), "done")
+                    msg = f"好哒，已经帮你把「{task.get('content')}」标记为完成了"
+                    print(msg)
+                    add_to_history(user_text, msg)
+                    return True
+                except Exception as e:
+                    logger.warning(f"完成任务失败: {e}")
 
     # 纠错意图识别升级：当用户说“时间不对/错了/现在是…”时，优先更新最近一个 pending 任务
     user_text_for_ai = user_text
@@ -530,7 +631,8 @@ def process_user_input(user_text: str) -> bool:
 
             did_update = False
 
-            if "content" in data:
+            # content 支持“未提供/为 null”：代表不改标题；只有显式提供字符串时才更新
+            if "content" in data and new_content is not None:
                 if not isinstance(new_content, str) or not new_content.strip():
                     print("新任务内容不能为空哦")
                     return False
@@ -615,23 +717,10 @@ def process_user_input(user_text: str) -> bool:
 
         elif action == "cancel_task":
             # 软取消任务：status='cancelled'（用于“取消上一个/刚才那个”）
-            task_id = data.get("task_id")
+            candidates = _pick_recent_pending(limit=5)
+            task_id = _normalize_task_id(data.get("task_id"), candidates)
             if task_id is None:
-                candidates = []
-                try:
-                    candidates = database.get_recent_tasks(status='pending', limit=3)
-                except Exception:
-                    candidates = []
-                if candidates:
-                    task_id = candidates[0]["id"]
-                else:
-                    print("没有可取消的待办任务")
-                    return False
-
-            try:
-                task_id = int(task_id)
-            except (ValueError, TypeError):
-                print("task_id 必须是整数哦")
+                print("没有可取消的待办任务")
                 return False
 
             old = database.get_task_by_id(task_id)
