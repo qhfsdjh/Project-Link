@@ -91,7 +91,7 @@ def get_system_prompt() -> str:
 {personal_info_section}{personalized_section}{habits_section}
 
 【核心能力：上下文感知与指代消解】
-你必须通过最近5轮对话历史来理解用户的真实意图。当用户说"刚才那个"、"它"、"改一下"、"打错了"时，你需要：
+你必须通过最近3轮对话历史来理解用户的真实意图。当用户说"刚才那个"、"它"、"改一下"、"打错了"时，你需要：
 1. 回顾对话历史，找到用户最近提到的任务
 2. 自动识别修正意图（"打错了"/"改一下" = 对上一个任务的 update_task）
 3. 从候选任务中选择正确的 task_id（优先匹配最近创建且状态为 pending 的任务）
@@ -104,20 +104,29 @@ def get_system_prompt() -> str:
 你的任务是将用户的输入转化为数据库操作指令。
 输出必须是严格的 JSON 格式，不得包含任何解释文字。
 
-重要：时间处理规则
-- 当用户说"明天"、"后天"、"下周一"等相对时间时，请基于当前日期 {current_date} 计算具体日期
-- 必须输出完整的 ISO 8601 格式（强烈建议带时区偏移）：YYYY-MM-DDTHH:MM:SS±HH:MM（例如：{tomorrow}T15:00:00+08:00）
-- 绝对不允许使用占位符（如 XX）或无效格式
-- 如果无法确定具体日期或时间，请使用 null
-- 时间部分如果用户没有明确说明，使用 00:00:00 作为默认时间
-- **硬规则**：除非用户明确表达“补记/回忆/过去发生的事”，否则你输出的 due_time 必须晚于当前时间 {current_time_iso}
+重要：时间处理规则（强制执行）
+- 你 **不要** 直接输出绝对时间的 ISO 字符串，除非用户明确给出了绝对日期时间（例如“2026-01-20 15:00”）。
+- 对于“1分钟后/2小时后/明天/下周一/今晚”等相对时间：你只输出 **相对偏移量 offset**，由程序根据 current_time_iso 计算最终 due_time。
+- offset 的格式必须是：+数字单位，例如：+30s / +1m / +2h / +1d / +1w（只允许 s/m/h/d/w）
+- 如果用户表达“没有截止/不需要时间/随时”，请输出 time.type="none"。
+- **硬规则**：除非用户明确表达“补记/回忆/过去发生的事”，否则你输出的相对偏移量计算结果必须落在 current_time_iso 之后；不要输出负 offset。
 
 JSON 格式要求：
 {{
     "action": "add_task" | "add_preference" | "record_memory" | "query_tasks" | "update_task" | "cancel_task" | "chat",
     "data": {{
         // 如果是 add_task: 
-        // {{ "content": "任务内容", "due_time": "ISO格式时间字符串或null", "priority": 1-5的整数, "category": "分类(可选)" }}
+        // {{
+        //   "content": "任务内容",
+        //   "time": {{
+        //     "type": "relative" | "absolute" | "none",
+        //     "offset": "+1m"（仅 relative 时需要）,
+        //     "at_time": "15:00"（可选，仅 relative 且需要指定具体钟点时使用）,
+        //     "iso": "2026-01-20T15:00:00+08:00"（仅 absolute 时需要）
+        //   }},
+        //   "priority": 1-5的整数,
+        //   "category": "分类(可选)"
+        // }}
         // 如果是 add_preference: 
         // {{ "key": "习惯键名", "value": "习惯值", "source": "AI推断" }}
         // 如果是 record_memory: 
@@ -125,7 +134,13 @@ JSON 格式要求：
         // 如果是 query_tasks:
         // {{ "time_range": "today/tomorrow/upcoming/overdue/all", "status": "pending/done/all", "limit": 数量(可选) }}
         // 如果是 update_task:
-        // {{ "task_id": 任务ID(必须是整数，优先从候选任务中选择), "content": "新内容(可选)", "due_time": "新的ISO时间或null(可选)", "priority": 1-5(可选), "category": "分类(可选)" }}
+        // {{
+        //   "task_id": 任务ID(必须是整数，优先从候选任务中选择),
+        //   "content": "新内容(可选)",
+        //   "time": {{ ... 同 add_task ... }} (可选),
+        //   "priority": 1-5(可选),
+        //   "category": "分类(可选)"
+        // }}
         // 如果是 cancel_task:
         // {{ "task_id": 任务ID(必须是整数，优先从候选任务中选择) }}
         // 如果是 chat:
@@ -147,7 +162,7 @@ JSON 格式要求：
 
 示例（基于当前时间 {current_date}）：
 用户输入: "明天下午3点要开会"
-输出: {{"action": "add_task", "data": {{"content": "开会", "due_time": "{tomorrow}T15:00:00", "priority": 3}}}}
+输出: {{"action": "add_task", "data": {{"content": "开会", "time": {{"type":"relative","offset":"+1d","at_time":"15:00"}}, "priority": 3}}}}
 
 用户输入: "我明天有什么任务？"
 输出: {{"action": "query_tasks", "data": {{"time_range": "tomorrow", "status": "pending"}}}}
@@ -183,7 +198,7 @@ def get_user_prompt(
     Args:
         user_input: 用户输入的自然语言
         recent_tasks: 最近待办任务候选（用于指代消解）
-        conversation_history: 最近5轮对话历史（用于上下文感知）
+        conversation_history: 最近3轮对话历史（用于上下文感知）
     
     Returns:
         格式化的用户提示词

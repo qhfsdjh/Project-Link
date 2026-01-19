@@ -13,7 +13,7 @@ import database  # 导入数据库模块
 import prompts  # 导入提示词模块
 import config  # 导入配置模块
 from utils.logger import get_logger  # 导入日志模块
-from utils.helpers import parse_time  # 导入时间解析工具
+from utils.helpers import parse_time, parse_offset  # 导入时间解析工具
 
 # 初始化日志记录器
 logger = get_logger("interpreter")
@@ -47,11 +47,11 @@ def add_to_history(user_input: str, ai_response: Optional[str] = None):
     global _conversation_history
     entry = {"user": user_input, "ai": ai_response}
     _conversation_history.append(entry)
-    # 只保留最近5轮
-    if len(_conversation_history) > 5:
-        _conversation_history = _conversation_history[-5:]
+    # 只保留最近3轮（强制提速：避免 token 堆积）
+    if len(_conversation_history) > 3:
+        _conversation_history = _conversation_history[-3:]
 
-def get_recent_history(limit: int = 5) -> list:
+def get_recent_history(limit: int = 3) -> list:
     """
     获取最近N轮对话历史
     
@@ -102,6 +102,94 @@ def parse_due_time(due_time_str: Optional[str]) -> Optional[str]:
             return None
     
     return None
+
+
+def _resolve_time_to_due_time_iso(
+    time_obj: Any,
+    *,
+    now: datetime,
+) -> Optional[str]:
+    """
+    将 LLM 输出的 time 对象解析成最终 due_time（ISO 字符串，带本地时区）。
+
+    约定：
+    - time.type = "none"  -> None
+    - time.type = "absolute" -> 使用 time.iso
+    - time.type = "relative" -> now + parse_offset(time.offset)，可选 time.at_time="HH:MM"
+    """
+    if time_obj is None:
+        return None
+
+    # 兼容旧字段：如果 LLM 仍输出 due_time（旧 prompt/旧模型缓存），继续走旧逻辑
+    if isinstance(time_obj, str):
+        return parse_due_time(time_obj)
+
+    if not isinstance(time_obj, dict):
+        raise ValueError(f"time 必须是对象/字符串/None，收到: {type(time_obj)}")
+
+    ttype = (time_obj.get("type") or "").strip().lower()
+    if ttype in ("", "none", "null"):
+        return None
+
+    if ttype == "absolute":
+        iso = time_obj.get("iso")
+        iso_norm = parse_due_time(iso)
+        if iso is not None and iso_norm is None:
+            raise ValueError(f"time.iso 不是合法 ISO: {iso!r}")
+        return iso_norm
+
+    if ttype == "relative":
+        offset = time_obj.get("offset")
+        if not isinstance(offset, str) or not offset.strip():
+            raise ValueError("time.offset 不能为空（relative 必填）")
+
+        delta = parse_offset(offset)
+        target = (now + delta).astimezone()
+
+        at_time = time_obj.get("at_time")
+        if isinstance(at_time, str) and at_time.strip():
+            parts = at_time.strip().split(":")
+            if len(parts) != 2:
+                raise ValueError(f"time.at_time 格式应为 HH:MM，收到: {at_time!r}")
+            hour = int(parts[0])
+            minute = int(parts[1])
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError(f"time.at_time 不合法: {at_time!r}")
+            target = target.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+        return target.isoformat()
+
+    raise ValueError(f"未知 time.type: {ttype!r}")
+
+
+def _ollama_chat_stream_text(**kwargs) -> str:
+    """
+    使用 Ollama stream 模式获取完整文本，同时在日志中记录原始流（截断）。
+    返回聚合后的 message content。
+    """
+    chunks = []
+    raw_preview = []
+    for part in ollama.chat(stream=True, **kwargs):
+        # 兼容 dict/对象两种形态
+        text = ""
+        if isinstance(part, dict):
+            text = (part.get("message") or {}).get("content") or ""
+        else:
+            try:
+                text = part.message.content  # type: ignore[attr-defined]
+            except Exception:
+                text = ""
+
+        if text:
+            chunks.append(text)
+            if len("".join(raw_preview)) < 500:
+                raw_preview.append(text)
+
+    preview = "".join(raw_preview)
+    if preview:
+        logger.info(f"[llm_stream_preview] {preview[:500]}")
+
+    return "".join(chunks)
 
 
 def _is_backfill_past_intent(user_text: str) -> bool:
@@ -343,8 +431,8 @@ def get_ai_interpretation(user_input: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.warning(f"获取最近任务候选失败: {e}")
     
-    # 获取最近5轮对话历史（用于上下文感知和指代消解）
-    conversation_history = get_recent_history(limit=5)
+    # 获取最近3轮对话历史（用于上下文感知和指代消解）
+    conversation_history = get_recent_history(limit=3)
     
     base_user_prompt = prompts.get_user_prompt(
         user_input,
@@ -365,25 +453,19 @@ def get_ai_interpretation(user_input: str) -> Optional[Dict[str, Any]]:
             )
 
         try:
-            response = ollama.chat(
+            response_text = _ollama_chat_stream_text(
                 model=MODEL_NAME,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt},
                 ],
                 format="json",
                 options={
                     "temperature": config.PL_AI_TEMPERATURE,
-                }
+                },
             )
 
-            # 提取响应内容
-            if isinstance(response, dict):
-                response_text = response.get('message', {}).get('content', '')
-            else:
-                response_text = response.message.content if hasattr(response, 'message') else ''
-
-            # 调试增强：记录 LLM 原始返回（截断）
+            # 调试增强：记录聚合后的 LLM 原始返回（截断）
             logger.info(f"[llm_raw] {response_text[:500]}")
 
             if not response_text:
@@ -398,19 +480,35 @@ def get_ai_interpretation(user_input: str) -> Optional[Dict[str, Any]]:
             action = parsed.get("action")
             data = parsed.get("data", {}) if isinstance(parsed.get("data"), dict) else {}
 
-            # 强制时间校验：add_task / update_task 的 due_time 不得早于当前时间（除非补记）
-            if action in ("add_task", "update_task") and isinstance(data, dict) and "due_time" in data:
-                due_time = parse_due_time(data.get("due_time"))
-                if due_time and not _validate_due_time_not_past(due_time, now, user_input):
+            # 时间统一校验：LLM 只输出 time（relative/absolute/none），由 Python 计算 due_time；
+            # 兼容旧字段 due_time（防止旧模型/旧缓存输出）。
+            if action in ("add_task", "update_task") and isinstance(data, dict):
+                due_time_candidate = None
+
+                if "time" in data:
+                    try:
+                        due_time_candidate = _resolve_time_to_due_time_iso(data.get("time"), now=now)
+                    except Exception as e:
+                        last_error_hint = f"time 解析失败：{e}。请修正 time 对象并仅输出 JSON。"
+                        continue
+                elif "due_time" in data:
+                    due_time_candidate = parse_due_time(data.get("due_time"))
+
+                if due_time_candidate and not _validate_due_time_not_past(due_time_candidate, now, user_input):
                     last_error_hint = (
-                        f"你计算出的 due_time={due_time} 早于当前时间 current_time_iso={current_time_iso}。"
-                        "除非用户明确说是补记/过去，否则 due_time 必须晚于当前时间。"
-                        "请重新计算相对时间（如“一分钟后/明天下午”等）并输出新的 due_time。"
+                        f"你输出的时间计算结果 due_time={due_time_candidate} 早于当前时间 current_time_iso={current_time_iso}。"
+                        "除非用户明确说是补记/过去，否则请输出一个正向 offset（例如 +1m/+2h/+1d）或正确的绝对时间。"
                     )
                     continue
 
-                # 写回规范化后的 due_time
-                data["due_time"] = due_time
+                # 将最终 due_time 写回（执行层直接用这个字段），并移除 time（避免后续分支混乱）
+                if "time" in data:
+                    data.pop("time", None)
+                if "due_time" in data:
+                    # 统一规范化（允许 None）
+                    data["due_time"] = due_time_candidate
+                else:
+                    data["due_time"] = due_time_candidate
                 parsed["data"] = data
 
             logger.debug(f"AI 解析成功，返回 JSON: {parsed}")
